@@ -1,0 +1,76 @@
+{
+  "version": 1,
+  "title": "代码审核报告",
+  "sections": [
+    {
+      "id": "requirements",
+      "title": "本次审核要求",
+      "level": 2,
+      "required": false,
+      "hint": "逐条列出本次实际生效的审核要求及其来源；无额外要求则写「无，按标准审核流程执行」。"
+    },
+    {
+      "id": "overview",
+      "title": "总体评价",
+      "level": 2,
+      "required": true,
+      "hint": "项目用途、技术栈、代码规模、整体质量评分（0-100 整数）及评分依据。"
+    },
+    {
+      "id": "issues_table",
+      "title": "问题清单",
+      "level": 2,
+      "required": true,
+      "type": "table",
+      "columns": ["编号", "级别", "文件:行号", "问题描述", "修改建议"],
+      "hint": "用 Markdown 表格，列头必须严格为：编号 | 级别 | 文件:行号 | 问题描述 | 修改建议。级别四档：严重 / 高 / 中 / 低。"
+    },
+    {
+      "id": "severity_detail",
+      "title": "严重与高危问题详述",
+      "level": 2,
+      "required": true,
+      "hint": "逐项给出原始代码片段、原因分析、影响范围、可直接套用的修复方案。"
+    },
+    {
+      "id": "security",
+      "title": "安全性专项检查",
+      "level": 2,
+      "required": true,
+      "hint": "覆盖：命令注入 / SQL 注入 / 路径穿越 / 越权与鉴权缺失 / 硬编码密钥 / 敏感信息泄漏 / 不安全反序列化 / 依赖风险 / 日志泄漏 / 并发与竞态 / 资源耗尽。"
+    },
+    {
+      "id": "architecture",
+      "title": "架构与可维护性",
+      "level": 2,
+      "required": true,
+      "hint": "模块划分、耦合、可读性、命名、错误处理、类型标注、日志与监控。"
+    },
+    {
+      "id": "testing",
+      "title": "测试与工程化",
+      "level": 2,
+      "required": true,
+      "hint": "测试覆盖现状、缺失的用例、CI/CD、依赖管理、文档。"
+    },
+    {
+      "id": "conclusion",
+      "title": "结论与放行建议",
+      "level": 2,
+      "required": true,
+      "hint": "给出「可放行 / 修改后放行 / 不建议放行」之一（结论词必须原样出现），并列出必须修复项清单。"
+    }
+  ],
+  "global_checks": [
+    {"id": "score", "desc": "总体评价中包含 0-100 的整数评分", "pattern": "(?:评分|得分|score)[^0-9]{0,12}(\\d{1,3})"},
+    {"id": "verdict", "desc": "结论中出现放行档位词", "pattern": "(可放行|修改后放行|不建议放行)"},
+    {"id": "issue_table_header", "desc": "问题清单表头列名正确", "pattern": "编号\\s*\\|\\s*级别\\s*\\|\\s*文件[:：]?\\s*行号\\s*\\|\\s*问题描述\\s*\\|\\s*修改建议"},
+    {"id": "min_length", "desc": "报告正文长度达标", "min_chars": 800}
+  ],
+  "verdict_keywords": ["可放行", "修改后放行", "不建议放行"],
+  "html_style": {
+    "title": "代码审核报告",
+    "accent": "#c0392b",
+    "max_width": "980px"
+  }
+}

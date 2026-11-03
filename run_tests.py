@@ -1,0 +1,39 @@
+"""统一测试入口：python run_tests.py
+
+包含:
+  1) pyflakes 静态检查（抓未定义名等——曾经真的漏过一个 task/t 拼写 bug）
+  2) 审核要求解析单测
+  3) 报告规范/校验器/HTML 渲染单测
+"""
+import subprocess
+import sys
+from pathlib import Path
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+BASE = Path(__file__).resolve().parent
+
+
+def run(cmd, label):
+    print(f"\n===== {label} =====")
+    p = subprocess.run(cmd, cwd=str(BASE), capture_output=True, text=True,
+                       encoding="utf-8", errors="replace")
+    out = (p.stdout or "") + (p.stderr or "")
+    print(out.strip()[-4000:])
+    return p.returncode
+
+
+rc = 0
+rc |= run([sys.executable, "-m", "pyflakes", "bot.py", "lib/md2html.py",
+           "test_requirements.py", "test_report_spec.py"], "1. 静态检查 pyflakes")
+rc |= run([sys.executable, "test_requirements.py"], "2. 审核要求解析")
+rc |= run([sys.executable, "test_report_spec.py"], "3. 报告规范/校验/渲染")
+rc |= run([sys.executable, "test_no_window.py"], "4. 黑窗防护（CREATE_NO_WINDOW）")
+
+print("\n" + "=" * 40)
+print("全部通过" if rc == 0 else "存在失败项")
+sys.exit(rc)

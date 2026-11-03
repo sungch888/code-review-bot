@@ -1,0 +1,32 @@
+# ---- 运行时数据（含邮件内容/被审代码/邮箱地址，绝不能提交）----
+work/
+logs/
+state/
+reports/
+nowin-*.log
+*.pi.log
+
+# ---- 本地真实配置（含邮箱地址），仓库内只保留 config.example.json ----
+config.json
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# ---- 编辑器 / 系统 ----
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# ---- 临时产物 ----
+*.zip
+*.tar.gz
+delivery_report.html
+nw.txt
+win.txt
