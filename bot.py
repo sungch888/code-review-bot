@@ -1291,6 +1291,9 @@ def main():
     p.add_argument("--thinking", default=None,
                    help="设置 thinking 级别: off/minimal/low/medium/high/xhigh/max")
     p.add_argument("--list", action="store_true", help="列出可用模型")
+    p = sub.add_parser("ui")
+    p.add_argument("--port", type=int, default=8770)
+    p.add_argument("--no-open", action="store_true")
 
     a = ap.parse_args()
     cmd = a.cmd or "status"
@@ -1355,6 +1358,11 @@ def main():
             print(f.read_text(encoding="utf-8", errors="replace")[-8000:] if f.exists() else "无日志")
     elif cmd == "model":
         sys.exit(cmd_model(a))
+    elif cmd == "ui":
+        ui_args = [sys.executable, str(BASE / "ui.py"), "--port", str(a.port)]
+        if a.no_open:
+            ui_args.append("--no-open")
+        os.execv(sys.executable, ui_args)
 
 
 if __name__ == "__main__":

@@ -25,6 +25,7 @@ cp config.example.json config.json
 # 4. 启动
 python bot.py start
 python bot.py status
+python bot.py ui        # 可选：打开可操作控制台 http://127.0.0.1:8770
 ```
 
 详细设计与运维命令见下文。
@@ -43,9 +44,53 @@ python bot.py scan       # 手动扫描一次并入队
 python bot.py logs       # 查看日志（--id msg_xxx 看单个任务的审核日志）
 python bot.py process --id msg_xxx   # 手动处理某个任务
 python bot.py retry --id msg_xxx     # 重置任务状态（重新处理）
+python bot.py model                  # 查看/修改审核模型
+python bot.py ui                     # 启动可操作控制台 UI
 ```
 
 启动后完全自动，无需人工干预，**回复邮件自动发出**（已按你的授权使用 `--confirmed` 免确认）。
+
+---
+
+## 一之二、可操作控制台 UI
+
+```bash
+python bot.py ui                  # 自动开浏览器，默认 http://127.0.0.1:8770
+python ui.py --port 8801          # 指定端口（被占用会自动向后找 +1..+9）
+python ui.py --no-open            # 不开浏览器（服务器/远程场景）
+```
+
+零第三方依赖（标准库 `http.server`），单文件 `ui.py`。
+
+### 能做什么
+
+| 页面 | 操作 |
+|------|------|
+| **控制台** `/` | 启动 / 重启 / 停止守护进程、立即扫描收件箱、改审核模型与 thinking、编辑全局审核要求 |
+| **任务列表** | 按状态统计（SEEN/DOWNLOADED/REVIEWED/REPLIED/FAILED/IGNORED）、逐条重跑 |
+| **任务详情** `/task/<id>` | 状态/尝试/错误/已回复时间、本次生效的审核要求、报告文件列表、AI 审核日志尾部；可重跑、可后台立即处理、可为该任务追加要求 |
+| **报告预览** `/report/<id>?f=<file>` | 在线渲染 Markdown（目录/表格/代码块），或下载原件 |
+| **JSON** `/api/status` | 给脚本/监控用的状态接口 |
+
+页面每 20s 自动刷新；操作后带 flash 提示（成功绿 / 失败红）。
+
+### 安全设计
+
+这是个**能触发真实发信**的面板，所以：
+
+| 防护 | 做法 |
+|------|------|
+| 只本机可访 | 绑定 `127.0.0.1`，非本机 Host 直接 403（防 DNS rebinding） |
+| CSRF | 启动时随机生成 token，所有写操作校验，缺失/伪造一律 403 |
+| XSS | 邮件主题、发件人名、错误信息、报告内容全部 HTML 转义；报告预览走本地 `md2html`（会转义原始 `<script>`），不直接吐被审代码 |
+| 路径穿越 | 报告读取/下载只允许 `work/<mid>/report/` 下的文件，`../` 一律 403 |
+| 危险操作确认 | 「重跑」会重新审核并**可能再次发信**，前端二次确认 |
+| 下载安全 | 报告一律 `Content-Disposition: attachment`，不在本站 origin 内联执行 HTML |
+
+验证：`python test_ui.py`（25 项，含 XSS / CSRF / 路径穿越 / 非法 Host）
+
+> 注意：面板无登录密码——它假定「能用这台机器的人就是主人」。
+> 需要远程访问请自己套 SSH 隧道或反代 + 鉴权，**不要直接暴露公网**。
 
 ---
 
