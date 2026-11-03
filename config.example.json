@@ -71,5 +71,6 @@
     ".class",
     ".jar"
   ],
-  "ignore_reply_threads": true
+  "ignore_reply_threads": true,
+  "review_chunk_files": 40
 }
