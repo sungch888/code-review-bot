@@ -37,10 +37,12 @@ import md2html           # noqa: E402
 
 CSI = secrets.token_urlsafe(18)          # CSRF token
 ALLOWED_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]"}
-STATE_ORDER = ["SEEN", "DOWNLOADED", "REVIEWED", "REPLIED", "FAILED", "IGNORED"]
+STATE_ORDER = ["SEEN", "DOWNLOADED", "REVIEWED", "AWAITING_APPROVAL", "REPLIED",
+               "REJECTED", "FAILED", "IGNORED"]
 STATE_COLOR = {
     "SEEN": "#8e8e93", "DOWNLOADED": "#0a84ff", "REVIEWED": "#5e5ce6",
-    "REPLIED": "#30d158", "FAILED": "#ff453a", "IGNORED": "#636366",
+    "AWAITING_APPROVAL": "#ff9f0a", "REPLIED": "#30d158", "REJECTED": "#ff6482",
+    "FAILED": "#ff453a", "IGNORED": "#636366",
 }
 REPORT_DIRNAME = "report"
 MAX_LOG_TAIL = 20000
@@ -521,17 +523,75 @@ def page_dashboard(flash: str = "", err: bool = False) -> str:
   </form>
 </div>
 """
-    body = (f'<div class="grid">{stats}</div>{controls}{card_provider()}'
+    # 待审批区（有就置顶高亮）
+    pending = [t for t in ts if t.get("state") == "AWAITING_APPROVAL"]
+    approval_section = ""
+    if pending:
+        prow = []
+        for t in pending:
+            mid = t.get("message_id", "")
+            has_report = bool(t.get("report") and (B.WORK / mid / "report").exists())
+            prow.append(f"""<tr>
+<td><a href="/task/{esc(mid)}">{esc((t.get('subject') or '')[:60])}</a>
+  <div class="mono">{esc(mid)} · {fmt_time(t.get('awaiting_since'))}</div></td>
+<td>{'✅ 报告已生成' if has_report else '…'}</td>
+<td><div class="row">
+  {form_btn("approve", "✅ 通过并发送", cls="primary", mid=mid,
+             confirm="审批通过后将把完整审核报告发送给发件人，确定？")}
+  {form_btn("reject", "✖ 驳回", cls="danger", mid=mid, confirm="驳回后不会发送，确定？")}
+  <a class="btn sm" href="/task/{esc(mid)}">看报告</a>
+</div></td></tr>""")
+        approval_section = f"""
+<div class="card" style="border:1px solid #ff9f0a">
+  <h2 style="color:#ff9f0a">⏳ 待审批（{len(pending)}）——审批通过后才会给发件人回信</h2>
+  <table><thead><tr><th>主题 / ID</th><th>报告</th><th>操作</th></tr></thead><tbody>
+  {''.join(prow) or '<tr><td colspan=3>无</td></tr>'}
+  </tbody></table>
+  <div class="hint">逐条审批更安全（可先「看报告」再决定）；想批量放行可在任务详情页操作。</div>
+</div>"""
+
+    # 审批/确认信 设置卡
+    ra = bool(B.CONFIG.get("require_approval", False))
+    ack_on = bool(B.CONFIG.get("ack_enabled", True))
+    ack_timeout = B.CONFIG.get("ack_timeout_sec", 300)
+    approval_cfg = f"""
+<div class="card">
+  <h2>审批闸 &amp; 处理中确认信</h2>
+  <form method="post" action="/action">
+    <input type="hidden" name="csrf" value="{CSI}">
+    <input type="hidden" name="action" value="approval_cfg">
+    <div class="row" style="align-items:flex-start">
+      <label style="margin:0 8px 0 0"><input type="checkbox" name="require_approval" {"checked" if ra else ""}> 开启人工审批</label>
+      <span class="hint">开启后审核完成会停在「待审批」，<b>不会自动回信</b>，你在页面点「通过」才发送</span>
+    </div>
+    <div style="border-top:1px solid var(--line);margin:12px 0"></div>
+    <div class="row" style="align-items:flex-start">
+      <label style="margin:0 8px 0 0"><input type="checkbox" name="ack_enabled" {"checked" if ack_on else ""}> 超时未出结果时先发一封「已收到、处理中」</label>
+      <span class="hint">让发件人知道任务没丢、卡在哪、大概多久；每个任务最多发一封</span>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <div style="width:180px"><label>确认信超时（秒）</label>
+        <input type="number" name="ack_timeout_sec" min="60" max="86400" value="{esc(ack_timeout)}"></div>
+      <span class="hint">任务创建超过此时长仍无结果即发确认信</span>
+    </div>
+    <div class="row" style="margin-top:12px"><button class="btn primary" type="submit">保存</button>
+      <span class="hint">保存后守护进程自动生效，无需重启</span></div>
+  </form>
+</div>"""
+
+    body = (f'<div class="grid">{stats}</div>{approval_section}{controls}{approval_cfg}{card_provider()}'
             f'<div class="card"><h2>任务列表</h2>{table}</div>')
     return layout("控制台", body, refresh=20, flash=flash, flash_err=err)
 
 
-def form_btn(action: str, label: str, cls: str = "", confirm: str = "") -> str:
+def form_btn(action: str, label: str, cls: str = "", confirm: str = "", mid: str = "") -> str:
     onc = f' onsubmit="return confirm(\'{confirm}\')"' if confirm else ""
     c = f"btn {cls}".strip()
+    mid_field = f'<input type="hidden" name="id" value="{esc(mid)}">' if mid else ""
     return (f'<form method="post" action="/action" style="display:inline"{onc}>'
             f'<input type="hidden" name="csrf" value="{CSI}">'
             f'<input type="hidden" name="action" value="{action}">'
+            f'{mid_field}'
             f'<button class="{c}" type="submit">{esc(label)}</button></form>')
 
 
@@ -566,7 +626,64 @@ def page_task(mid: str, flash: str = "", err: bool = False) -> str:
     if pi_log.exists():
         log_txt = pi_log.read_text(encoding="utf-8", errors="replace")[-MAX_LOG_TAIL:]
 
+    st = (t.get("state") or "").upper()
+    approval_panel = ""
+    if st == "AWAITING_APPROVAL":
+        has_report = bool(t.get("report") and (B.WORK / mid / "report").exists())
+        report_link = (f'<a class="btn" href="/report/{esc(mid)}?f='
+                       f'{urllib.parse.quote("代码审核报告.md")}">预览报告</a>') if has_report else ""
+        approval_panel = f"""
+<div class="card" style="border:1px solid #ff9f0a">
+  <h2 style="color:#ff9f0a">⏳ 待审批——通过后才给发件人回信</h2>
+  <div class="hint">审核已完成。建议先「预览报告」核对内容，再决定通过或驳回。</div>
+        <div class="row" style="margin-top:12px">
+          {form_btn("approve", "✅ 审批通过并发送报告", "primary", mid=mid,
+                     confirm="审批通过后将把完整审核报告发送给发件人，确定？")}
+          {form_btn("reject", "✖ 驳回（不发送）", "danger", mid=mid,
+                     confirm="驳回后不会发送回复，确定？")}
+          {report_link}
+        </div>
+  <form method="post" action="/action" style="margin-top:10px">
+    <input type="hidden" name="csrf" value="{CSI}">
+    <input type="hidden" name="action" value="reject_reason">
+    <input type="hidden" name="id" value="{esc(mid)}">
+    <div class="row">
+      <input type="text" name="reason" placeholder="驳回原因（可选，仅记录，不发给发件人）" style="flex:1;min-width:200px">
+      <button class="btn danger" type="submit">保存驳回原因</button>
+    </div>
+  </form>
+</div>"""
+    elif st == "REJECTED":
+        approval_panel = f"""
+<div class="card" style="border:1px solid #ff6482">
+  <h2 style="color:#ff6482">✖ 已驳回（未发送）</h2>
+  <div class="kv">
+    <div class="k">驳回时间</div><div>{fmt_time(t.get('rejected_at'))}</div>
+    <div class="k">驳回原因</div><div>{esc(t.get('reject_reason') or '（未填写）')}</div>
+  </div>
+  <div class="row" style="margin-top:12px">
+    {form_btn("retry", "重新审核", "primary", mid=mid,
+               confirm="重新审核会重新走一遍流程，确定？")}
+  </div>
+</div>"""
+    elif st == "REPLIED" and t.get("approved_at"):
+        approval_panel = f"""
+<div class="card" style="border:1px solid #30d158">
+  <h2 style="color:#30d158">✅ 已审批通过并发送</h2>
+  <div class="kv">
+    <div class="k">审批时间</div><div>{fmt_time(t.get('approved_at'))}</div>
+    <div class="k">审批人</div><div>{esc(t.get('approved_by') or '（未记录）')}</div>
+    <div class="k">发送时间</div><div>{fmt_time(t.get('replied_at'))}</div>
+  </div>
+</div>"""
+
+    ack_line = ""
+    if t.get("ack_sent_at"):
+        ack_line = (f'<div class="k">处理中确认信</div>'
+                    f'<div>已于 {fmt_time(t.get("ack_sent_at"))} 发送</div>')
+
     body = f"""
+{approval_panel}
 {warn_html}
 <div class="card">
   <h2>{esc(t.get('subject'))}</h2>
@@ -576,6 +693,7 @@ def page_task(mid: str, flash: str = "", err: bool = False) -> str:
     <div class="k">时间</div><div>{fmt_time(t.get('created_at'))}</div>
     <div class="k">尝试次数</div><div>{esc(t.get('attempts', 0))}</div>
     <div class="k">已回复</div><div>{fmt_time(t.get('replied_at'))}</div>
+    {ack_line}
     <div class="k">最后错误</div><div class="mono">{esc(t.get('last_error') or '-')}</div>
     <div class="k">message_id</div><div class="mono">{esc(mid)}</div>
   </div>
@@ -751,6 +869,47 @@ def do_action(form: dict) -> tuple:
         rc, out = run_bot_cli("req", "--id", mid, val if val else "-")
         return (f"已保存任务要求 {mid[-8:]}", False, f"/task/{mid}") if rc == 0 \
             else (f"保存失败: {out[:300]}", True, f"/task/{mid}")
+
+    if a == "approve":
+        try:
+            B.approve_task(mid, approver="ui")
+            return ("✅ 审批通过，报告已发送给发件人", False, f"/task/{mid}")
+        except Exception as e:
+            return (f"审批失败：{e}", True, f"/task/{mid}")
+
+    if a == "reject":
+        reason = (form.get("reason") or [""])[0]
+        try:
+            B.reject_task(mid, reason)
+            return ("✖ 已驳回（未发送）", False, f"/task/{mid}")
+        except Exception as e:
+            return (f"驳回失败：{e}", True, f"/task/{mid}")
+
+    if a == "reject_reason":
+        reason = (form.get("reason") or [""])[0]
+        t = B.load_task(mid)
+        if t and t.get("state") in ("AWAITING_APPROVAL", "REJECTED"):
+            if reason:
+                t["reject_reason"] = reason[:1000]
+                B.save_task(t)
+            return ("已保存驳回原因", False, f"/task/{mid}")
+        return (f"无法保存驳回原因（当前状态 {t.get('state') if t else '不存在'}）", True, f"/task/{mid}")
+
+    if a == "approval_cfg":
+        ra = (form.get("require_approval") or [""])[0] == "on"
+        ack_on = (form.get("ack_enabled") or [""])[0] == "on"
+        timeout_s = (form.get("ack_timeout_sec") or [""])[0].strip()
+        B.CONFIG["require_approval"] = ra
+        B.CONFIG["ack_enabled"] = ack_on
+        if timeout_s:
+            try:
+                B.CONFIG["ack_timeout_sec"] = int(timeout_s)
+            except ValueError:
+                return ("确认信超时必须是整数", True, "/")
+        B._save_config()
+        B.reload_config()
+        reload_config()
+        return ("审批 / 确认信设置已保存", False, "/")
 
     if a in ("provider", "model"):
         err = B.apply_provider(form_flat(form))

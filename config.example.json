@@ -84,5 +84,8 @@
   "llm_timeout_sec": 600,
   "max_chars_per_chunk": 120000,
   "max_file_chars": 30000,
-  "fallback_model": ""
+  "fallback_model": "",
+  "require_approval": false,
+  "ack_enabled": true,
+  "ack_timeout_sec": 300
 }

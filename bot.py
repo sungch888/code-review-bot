@@ -346,11 +346,13 @@ def ignore_reason(msg: dict):
 
 
 def enqueue(msg: dict) -> str:
-    """幂等入队：已 REPLIED 的任务直接跳过；自己发的/回复邮件直接忽略"""
+    """幂等入队：已 REPLIED/已驳回/待审批 的任务直接跳过；自己发的/回复邮件直接忽略"""
     mid = msg["message_id"]
     t = load_task(mid)
     if t is not None and t.get("state") == "REPLIED":
         return "DONE_SKIP"
+    if t is not None and t.get("state") in ("REJECTED", "AWAITING_APPROVAL"):
+        return f"DONE_SKIP_{t.get('state')}"
     if t is not None and t.get("state") == "FAILED" and t.get("attempts", 0) >= CONFIG["max_retries"]:
         return "FAILED_SKIP"
 
@@ -460,6 +462,12 @@ def scan_once():
             wait = int(t.get("next_retry_at", 0) - now())
             log(f"退避中 {mid} | 剩余 {max(0, wait)}s 后重试 | {m.get('subject')}")
     log(f"扫描完成: 命中 {len(found)} 封 -> {counts}")
+    try:
+        n = ack_sweep()          # 超时未出结果的任务 -> 发「已收到、处理中」确认信
+        if n:
+            log(f"本次发出 {n} 封处理中确认信")
+    except Exception as e:
+        log(f"ack_sweep 异常: {e}", "WARN")
     return found
 
 
@@ -1350,6 +1358,113 @@ def send_reply(task, report_dir: Path):
     return do_reply(mid, minimal, alt or files)
 
 
+# ---------------------------------------------------------------- 审批
+TERMINAL_STATES = ("REPLIED", "REJECTED", "IGNORED")
+WORKING_STATES = ("SEEN", "DOWNLOADED", "REVIEWED", "AWAITING_APPROVAL", "FAILED")
+
+
+def require_approval() -> bool:
+    return bool(CONFIG.get("require_approval", False))
+
+
+def approve_task(mid: str, approver: str = "") -> dict:
+    """审批通过 -> 发送报告回复 -> REPLIED"""
+    t = load_task(mid)
+    if t is None:
+        raise RuntimeError("任务不存在")
+    if t.get("state") not in ("AWAITING_APPROVAL", "REVIEWED"):
+        raise RuntimeError(f"当前状态 {t.get('state')} 不能审批通过（需处于待审批/已审核）")
+    rpt = Path(t.get("report") or (WORK / mid / "report"))
+    if not rpt.exists():
+        raise RuntimeError("找不到报告目录，无法发送")
+    send_reply(t, rpt)
+    t["state"] = "REPLIED"
+    t["replied_at"] = iso()
+    t["approved_at"] = iso()
+    if approver:
+        t["approved_by"] = approver
+    t["last_error"] = None
+    save_task(t)
+    log(f"[{mid}] 审批通过，报告已发送")
+    return t
+
+
+def reject_task(mid: str, reason: str = "") -> dict:
+    """审批不通过 -> 不发送 -> REJECTED"""
+    t = load_task(mid)
+    if t is None:
+        raise RuntimeError("任务不存在")
+    if t.get("state") not in ("AWAITING_APPROVAL", "REVIEWED"):
+        raise RuntimeError(f"当前状态 {t.get('state')} 不能驳回（需处于待审批/已审核）")
+    t["state"] = "REJECTED"
+    t["rejected_at"] = iso()
+    if reason:
+        t["reject_reason"] = reason[:1000]
+    save_task(t)
+    log(f"[{mid}] 审批驳回：{reason or '(无原因)'}", "WARN")
+    return t
+
+
+# ---------------------------------------------------------------- 确认信（任务已收到、处理中）
+def eta_hint(task) -> str:
+    """给发件人的预计完成时间（粗略，避免过度承诺）"""
+    state = (task.get("state") or "").upper()
+    if state == "AWAITING_APPROVAL":
+        return "取决于审批人处理时间，通常几分钟到几十分钟内"
+    if state in ("REVIEWED", "DOWNLOADED"):
+        return "约 5~20 分钟内（取决于代码规模与模型响应）"
+    if state == "FAILED":
+        return "自动重试间隔 5~15 分钟，视模型服务恢复情况而定"
+    return "约 5~30 分钟内（视队列长度与代码规模）"
+
+
+def send_ack(task) -> None:
+    """发一封「已收到、处理中」的确认信，让发件人知道任务没丢、卡在哪、大概多久。"""
+    mid = task["message_id"]
+    state_desc = ANOMALY.describe_state(task.get("state"), task.get("attempts", 0))
+    body = ANOMALY.reply_ack(task.get("subject", ""), state_desc, eta_hint(task))
+    do_reply(mid, body, [])
+    log(f"[{mid}] 已发送处理中确认信（状态 {task.get('state')}）")
+
+
+def ack_sweep() -> int:
+    """周期性检查：任务超过阈值还没出结果、且还没发过确认信 -> 发一封。
+
+    只对「进行中」的任务发；已回复/驳回/忽略的不再打扰；每个任务最多发一封。
+    失败且重试用尽的任务走的是「失败通知」，不发「处理中」。
+    """
+    if not CONFIG.get("ack_enabled", True):
+        return 0
+    try:
+        timeout = int(CONFIG.get("ack_timeout_sec", 300))
+    except (TypeError, ValueError):
+        timeout = 300
+    sent = 0
+    for t in all_tasks():
+        state = (t.get("state") or "").upper()
+        if state in TERMINAL_STATES or state == "":
+            continue
+        if state == "FAILED" and t.get("attempts", 0) >= CONFIG["max_retries"]:
+            continue
+        if t.get("ack_sent_at"):
+            continue
+        age = now() - (t.get("created_at_ts") or 0)
+        if age < timeout:
+            continue
+        try:
+            with Lock(f"ack-{t['message_id']}", timeout=5):
+                t2 = load_task(t["message_id"]) or t
+                if t2.get("ack_sent_at"):
+                    continue
+                send_ack(t2)
+                t2["ack_sent_at"] = iso()
+                save_task(t2)
+                sent += 1
+        except Exception as e:
+            log(f"确认信发送失败 {t.get('message_id')}: {e}", "WARN")
+    return sent
+
+
 def do_reply(mid, body, files):
     args = ["message", "+reply", "--id", mid, "--body", body, "--confirmed"]
     for f in files:
@@ -1566,7 +1681,15 @@ def process_task(mid: str) -> str:
         t["report"] = str(rpt)
         save_task(t)
 
-        # 6. 回复（带报告附件）
+        # 6. 审批闸：开了审批就停下等人批，不自动发
+        if require_approval():
+            t["state"] = "AWAITING_APPROVAL"
+            t["awaiting_since"] = iso()
+            save_task(t)
+            log(f"[{mid}] 审核完成，等待人工审批（require_approval 已开启）")
+            return "AWAITING_APPROVAL"
+
+        # 未开审批 -> 直接回复（带报告附件）
         send_reply(t, rpt)
         t["state"] = "REPLIED"
         t["replied_at"] = iso()
@@ -1773,6 +1896,9 @@ def status():
           f"{CONFIG.get('max_chars_per_chunk')} 字符")
     print(f"轮询间隔: {CONFIG['poll_interval_sec']}s   并发worker: {CONFIG['max_workers']}   "
           f"最大重试: {CONFIG['max_retries']}")
+    print(f"审批闸: {'开启（审核完先等人工审批再发送）' if require_approval() else '关闭（审核完自动发送）'}")
+    print(f"处理中确认信: {'开启' if CONFIG.get('ack_enabled', True) else '关闭'}   "
+          f"超时 {CONFIG.get('ack_timeout_sec', 300)}s 未出结果时发送")
     if PIDFILE.exists():
         print(f"后台进程: {PIDFILE.read_text(encoding='utf-8').strip()}")
     else:
@@ -1781,7 +1907,8 @@ def status():
     for t in tasks:
         buckets.setdefault(t.get("state"), []).append(t)
     print(f"\n任务总数: {len(tasks)}")
-    for st in ("SEEN", "DOWNLOADED", "REVIEWED", "REPLIED", "FAILED", "IGNORED"):
+    for st in ("SEEN", "DOWNLOADED", "REVIEWED", "AWAITING_APPROVAL", "REPLIED",
+               "REJECTED", "FAILED", "IGNORED"):
         arr = buckets.get(st, [])
         if not arr:
             continue
@@ -2088,6 +2215,12 @@ def main():
     p = sub.add_parser("retry")
     p.add_argument("--id", required=True)
     p.add_argument("--requirements", default="", help="重置时同时更新审核要求")
+    p = sub.add_parser("approve", help="审批通过：发送报告回复给发件人")
+    p.add_argument("--id", required=True)
+    p.add_argument("--approver", default="", help="审批人（可选，仅记录）")
+    p = sub.add_parser("reject", help="审批驳回：不发送，标记为已驳回")
+    p.add_argument("--id", required=True)
+    p.add_argument("--reason", default="", help="驳回原因（可选）")
     p = sub.add_parser("req")
     p.add_argument("--id", required=True, help="为指定邮件设置审核要求")
     p.add_argument("--requirements", default="", help="要求文本；传 - 表示清除")
@@ -2165,6 +2298,20 @@ def main():
             print(f"已重置 {a.id}")
         else:
             print("任务不存在")
+    elif cmd == "approve":
+        try:
+            approve_task(a.id, getattr(a, "approver", ""))
+            print(f"审批通过，报告已发送给发件人: {a.id}")
+        except Exception as e:
+            print(f"审批失败: {e}")
+            sys.exit(1)
+    elif cmd == "reject":
+        try:
+            reject_task(a.id, getattr(a, "reason", ""))
+            print(f"已驳回: {a.id}")
+        except Exception as e:
+            print(f"驳回失败: {e}")
+            sys.exit(1)
     elif cmd == "logs":
         if a.id:
             f = LOGS / f"{a.id}.pi.log"

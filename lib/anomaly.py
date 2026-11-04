@@ -229,3 +229,39 @@ def reply_report_warning(subject: str, warnings) -> str:
 {detail}
 
 谢谢。"""
+
+
+# ---------------------------------------------------------------- 确认信（任务已收到，处理中）
+def describe_state(state: str, attempts: int = 0) -> str:
+    """把内部状态翻译成发件人能看懂的「现在在干嘛」"""
+    s = (state or "").upper()
+    if s == "AWAITING_APPROVAL":
+        return "代码审核已完成，正在等待人工审批（审批通过即发送报告）"
+    if s == "REVIEWED":
+        return "代码审核已完成，正在整理报告准备发送"
+    if s == "DOWNLOADED":
+        return "代码包已下载，AI 正在逐文件审核（代码较多时会分多批进行）"
+    if s == "SEEN":
+        return "已进入审核队列，正在排队等待处理"
+    if s == "FAILED":
+        return (f"审核遇到临时问题（如模型服务繁忙/超时），正在自动重试（已重试 {attempts} 次）")
+    return "正在处理中"
+
+
+def reply_ack(subject: str, state_desc: str, eta_hint: str) -> str:
+    """超过一定时间还没出结果时，先回一封「已收到、处理中」的确认信。
+
+    目的：让发件人知道任务没丢、现在卡在哪、大概还要多久，避免干等。
+    """
+    return f"""你好，
+
+《{subject}》的代码审核请求**已收到**，正在处理中，先给你同步一下进度：
+
+当前状态：{state_desc}
+
+预计完成时间：{eta_hint}
+
+处理完成后，我会**立即**把完整的审核报告发给你。在此期间**无需重复发送**，
+我会一直跟进；如果最终没能完成，也会明确告诉你原因和下一步怎么办。
+
+谢谢。"""

@@ -289,6 +289,60 @@ def main():
         check("正常下载返回 200", st == 200, st)
         check("下载带 attachment", "attachment" in (hdr.get("Content-Disposition") or ""),
               hdr.get("Content-Disposition"))
+
+        # 9. 审批面板
+        appr_mid = "msg_UItestAPPR"
+        rpt = B.WORK / appr_mid / "report"
+        rpt.mkdir(parents=True, exist_ok=True)
+        (rpt / "代码审核报告.md").write_text("# 报告\n内容", encoding="utf-8")
+        (rpt / "summary.md").write_text("摘要", encoding="utf-8")
+        B.save_task({
+            "message_id": appr_mid, "subject": "代码审核-审批UI测试",
+            "from": "u@example.com", "from_name": "U",
+            "created_at": B.iso(), "created_at_ts": B.now(),
+            "state": "AWAITING_APPROVAL", "attempts": 1, "report": str(rpt),
+            "last_error": None, "replied_at": None,
+        })
+
+        st, _, body = get("/")
+        check("看板出现「待审批」区", "待审批" in body, body[:120])
+        check("看板出现「审批闸」设置卡", "审批闸" in body and "require_approval" in body,
+              body[:120])
+        check("看板出现「确认信」设置", "确认信" in body, body[:200])
+
+        st, _, body = get(f"/task/{appr_mid}")
+        check("任务页出现待审批面板", "待审批" in body and "审批通过" in body, body[:150])
+        check("任务页有驳回按钮", "驳回" in body, body[:150])
+        check("任务页有预览报告链接", "预览报告" in body, body[:200])
+
+        # 9.1 approve/reject 动作（mock 掉真实发送，避免发信）
+        real_approve, real_reject = B.approve_task, B.reject_task
+        called = {}
+        B.approve_task = lambda mid, approver="": called.update(approve=mid) or B.load_task(mid)
+        B.reject_task = lambda mid, reason="": called.update(reject=mid) or B.load_task(mid)
+        try:
+            st, hdr, _ = post("/action", {"action": "approve", "csrf": ui.CSI, "id": appr_mid})
+            check("approve 动作重定向到任务页", (hdr.get("Location") or "").startswith("/task/"),
+                  hdr.get("Location"))
+            check("approve 调用了 B.approve_task", called.get("approve") == appr_mid, str(called))
+            st, _, _ = post("/action", {"action": "reject", "csrf": ui.CSI, "id": appr_mid,
+                                        "reason": "测试驳回"})
+            check("reject 调用了 B.reject_task", called.get("reject") == appr_mid, str(called))
+        finally:
+            B.approve_task, B.reject_task = real_approve, real_reject
+
+        # 9.2 审批配置保存
+        st, _, _ = post("/action", {"action": "approval_cfg", "csrf": ui.CSI,
+                                   "require_approval": "on", "ack_enabled": "on",
+                                   "ack_timeout_sec": "420"})
+        check("require_approval 已保存", B.CONFIG.get("require_approval") is True,
+              str(B.CONFIG.get("require_approval")))
+        check("ack_timeout_sec 已保存", B.CONFIG.get("ack_timeout_sec") == 420,
+              str(B.CONFIG.get("ack_timeout_sec")))
+        # 还原为默认（关闭审批）
+        B.CONFIG["require_approval"] = False
+        B.CONFIG["ack_timeout_sec"] = 300
+        B._save_config()
     finally:
         try:
             (BASE / "config.json").write_text(cfg_backup, encoding="utf-8")
@@ -297,6 +351,11 @@ def main():
         B.reload_config()
         srv.shutdown()
         B.TASKS.joinpath(f"{xss_mid}.json").unlink(missing_ok=True)
+        _appr_mid = locals().get("appr_mid")
+        if _appr_mid:
+            B.TASKS.joinpath(f"{_appr_mid}.json").unlink(missing_ok=True)
+            import shutil
+            shutil.rmtree(B.WORK / _appr_mid, ignore_errors=True)
         import shutil
         shutil.rmtree(B.WORK / xss_mid, ignore_errors=True)
 
