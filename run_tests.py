@@ -28,10 +28,10 @@ def run(cmd, label):
 
 
 rc = 0
-rc |= run([sys.executable, "-m", "pyflakes", "bot.py", "ui.py", "lib/md2html.py",
+rc |= run([sys.executable, "-m", "pyflakes", "bot.py", "ui.py", "lib/md2html.py", "lib/llm.py", "lib/anomaly.py",
            "test_requirements.py", "test_report_spec.py", "test_ui.py",
            "test_retry.py", "test_chunk.py", "test_lock.py",
-           "test_anomaly.py"],
+           "test_anomaly.py", "test_llm.py"],
          "1. 静态检查 pyflakes")
 rc |= run([sys.executable, "test_requirements.py"], "2. 审核要求解析")
 rc |= run([sys.executable, "test_report_spec.py"], "3. 报告规范/校验/渲染")
@@ -39,8 +39,9 @@ rc |= run([sys.executable, "test_retry.py"], "4. 重试/退避/上游繁忙")
 rc |= run([sys.executable, "test_chunk.py"], "5. 分块审核")
 rc |= run([sys.executable, "test_lock.py"], "6. 僵尸锁检测")
 rc |= run([sys.executable, "test_anomaly.py"], "7. 异常回信（不误报/可操作）")
-rc |= run([sys.executable, "test_ui.py"], "8. 控制台 UI（路由/XSS/CSRF/路径穿越）")
-rc |= run([sys.executable, "test_no_window.py"], "9. 黑窗防护（CREATE_NO_WINDOW）")
+rc |= run([sys.executable, "test_llm.py"], "8. 通用模型接入（base_url/模型列表/错误翻译）")
+rc |= run([sys.executable, "test_ui.py"], "9. 控制台 UI（路由/XSS/CSRF/路径穿越/模型接入）")
+rc |= run([sys.executable, "test_no_window.py"], "10. 黑窗防护（CREATE_NO_WINDOW）")
 
 print("\n" + "=" * 40)
 print("全部通过" if rc == 0 else "存在失败项")

@@ -72,5 +72,17 @@
     ".jar"
   ],
   "ignore_reply_threads": true,
-  "review_chunk_files": 40
+  "review_chunk_files": 40,
+  "llm_backend": "auto",
+  "llm_protocol": "openai",
+  "llm_base_url": "https://api.deepseek.com",
+  "llm_api_key": "",
+  "llm_model": "deepseek-chat",
+  "llm_thinking": "",
+  "llm_temperature": 0.2,
+  "llm_max_output_tokens": 8000,
+  "llm_timeout_sec": 600,
+  "max_chars_per_chunk": 120000,
+  "max_file_chars": 30000,
+  "fallback_model": ""
 }

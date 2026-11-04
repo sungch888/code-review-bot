@@ -128,6 +128,14 @@ tr:hover td{background:#1c2029}
 .btn.primary{background:#1f4fa8;border-color:#2c62c9;color:#fff}
 .btn.danger{background:#4a1f22;border-color:#732a2f;color:#ff9a9a}
 .btn.sm{padding:3px 8px;font-size:12px}
+.btn[disabled]{opacity:.5;cursor:default}
+input[type=password],input[type=number]{background:#12151b;border:1px solid var(--line);
+ color:var(--fg);border-radius:7px;padding:7px 9px;font:13px/1.5 inherit;width:100%}
+.out{margin-top:12px;font-size:12.5px;line-height:1.7;white-space:pre-wrap;
+ border-left:3px solid var(--line);padding:8px 12px;background:#12151b;border-radius:0 8px 8px 0}
+.out.bad{border-left-color:#ff453a;color:#ff9d9d}
+.out.ok{border-left-color:#30d158;color:#8ff0b1}
+.hint{color:var(--dim);font-size:12px;line-height:1.6}
 .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 input[type=text],textarea,select{background:#12151b;border:1px solid var(--line);color:var(--fg);
  border-radius:7px;padding:7px 9px;font:13px/1.5 inherit;width:100%}
@@ -149,6 +157,57 @@ pre{background:#0b0d12;border:1px solid var(--line);border-radius:8px;padding:13
 .md code{background:#20242e;padding:1px 5px;border-radius:4px}
 .md pre{max-height:none}
 footer{color:var(--dim);font-size:12px;margin-top:34px;border-top:1px solid var(--line);padding-top:14px}
+"""
+
+# 模型服务面板用的前端脚本（单文件、零依赖，不拉外部 JS）
+PROV_FIELDS = ["backend", "base_url", "protocol", "api_key", "model", "thinking",
+               "fallback", "max_output_tokens", "max_chars_per_chunk", "review_chunk_files"]
+PROV_JS = """
+var PROV_FIELDS = ["backend","base_url","protocol","api_key","model","thinking",
+                   "fallback","max_output_tokens","max_chars_per_chunk","review_chunk_files"];
+function provParams(){
+  var f = document.getElementById('provform');
+  var p = new URLSearchParams();
+  p.set('csrf', CSRF);
+  PROV_FIELDS.forEach(function(k){ var el = f.elements[k]; if (el && el.value !== '') p.set(k, el.value); });
+  return p;
+}
+function provOut(msg, cls){
+  var o = document.getElementById('provout');
+  o.className = 'out ' + (cls || '');
+  o.textContent = msg;
+}
+async function provRun(url, btn){
+  var old = btn.textContent;
+  btn.disabled = true; btn.textContent = '处理中…';
+  provOut('请稍候…');
+  try {
+    var r = await fetch(url, {method:'POST', body: provParams()});
+    var j = await r.json();
+    if (j.error) { provOut(j.error, 'bad'); }
+    else if (j.models) {
+      var sel = document.getElementById('modelpick');
+      var cur = document.getElementById('model').value;
+      sel.innerHTML = '';
+      var o0 = document.createElement('option'); o0.value=''; o0.textContent='（从列表选模型…）';
+      sel.appendChild(o0);
+      j.models.forEach(function(m){
+        var o = document.createElement('option'); o.value=m; o.textContent=m;
+        if (m === cur) o.selected = true;
+        sel.appendChild(o);
+      });
+      sel.style.display = 'block';
+      provOut(j.message || ('共 ' + j.models.length + ' 个模型，选一个再点保存'));
+    } else {
+      provOut(j.message || '完成', j.ok ? 'ok' : 'bad');
+    }
+  } catch (e) { provOut('请求失败：' + e, 'bad'); }
+  btn.disabled = false; btn.textContent = old;
+}
+document.addEventListener('DOMContentLoaded', function(){
+  var m = document.getElementById('modelpick');
+  if (m) m.addEventListener('change', function(){ if (m.value) document.getElementById('model').value = m.value; });
+});
 """
 
 
@@ -178,7 +237,10 @@ def layout(title: str, body: str, refresh: int = 0, flash: str = "", flash_err: 
 {f}
 {body}
 <footer>本地控制台 · 仅监听 127.0.0.1 · 模型 {esc(B.effective_model_desc())}</footer>
-</div></body></html>"""
+</div>
+<script>const CSRF = "{CSI}";</script>
+<script>{PROV_JS}</script>
+</body></html>"""
 
 
 def badge(state: str) -> str:
@@ -191,6 +253,87 @@ def fmt_time(iso: str) -> str:
 
 
 # ---------------------------------------------------------------- 页面：控制台
+def card_provider() -> str:
+    """模型接入卡片：填 base_url / api_key 就能跑，不依赖本机装了什么 CLI"""
+    st = B.provider_status()
+    cfg = B.CONFIG
+    levels = ("", "off", "minimal", "low", "medium", "high", "xhigh", "max")
+    backends = (("auto", "自动（填了 base_url 就直连，否则用 pi）"),
+                ("http", "http：直连模型服务（推荐，无需任何本地 CLI）"),
+                ("pi", "pi：调用本机 pi CLI"))
+    cur_think = st["thinking"] if st["backend"] == "http" else (cfg.get("pi_thinking") or "")
+    cur_model = st["model"] if st["backend"] == "http" else (cfg.get("pi_model") or "")
+    key_hint = (st["key_masked"] or ("本地 ollama 可留空" if st["protocol"] == "ollama"
+                                     else "未设置"))
+
+    def opts(pairs, cur):
+        return "".join(f'<option value="{esc(v)}"'
+                       f'{" selected" if v == cur else ""}>{esc(lbl)}</option>'
+                       for v, lbl in pairs)
+
+    return f"""
+<div class="card">
+  <h2>模型接入</h2>
+  <form method="post" action="/action" id="provform">
+    <input type="hidden" name="csrf" value="{CSI}">
+    <input type="hidden" name="action" value="provider">
+    <div class="row">
+      <div style="width:230px"><label>后端</label>
+        <select name="backend">{opts(backends, st["backend"])}</select></div>
+      <div style="flex:2;min-width:280px"><label>Base URL（会自动补 /v1）</label>
+        <input type="text" name="base_url" value="{esc(cfg.get('llm_base_url') or '')}"
+               placeholder="https://api.deepseek.com 或 http://127.0.0.1:11434"></div>
+      <div style="width:160px"><label>协议</label>
+        <select name="protocol">{opts((("", "自动识别"),
+                                      ("openai", "openai（兼容 chat/completions）"),
+                                      ("anthropic", "anthropic（/v1/messages）"),
+                                      ("ollama", "ollama（本地）")),
+                                      cfg.get("llm_protocol") or "")}</select></div>
+      <div style="flex:1;min-width:200px"><label>API Key（当前：{esc(key_hint)}）</label>
+        <input type="password" name="api_key" value="" placeholder="留空 = 不改动" autocomplete="new-password"></div>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <div style="flex:2;min-width:260px"><label>模型名</label>
+        <input type="text" id="model" name="model" value="{esc(cur_model)}"
+               placeholder="deepseek-chat / gpt-4o-mini / qwen2.5-coder …"></div>
+      <div style="flex:2;min-width:260px;display:none"><label>从服务拉到的模型</label>
+        <select id="modelpick"></select></div>
+      <div style="width:150px"><label>思考强度</label>
+        <select name="thinking">{opts([(l, l or "默认") for l in levels], cur_think)}</select></div>
+      <div style="flex:1;min-width:180px"><label>备用模型（上游繁忙自动切）</label>
+        <input type="text" name="fallback" value="{esc(st['fallback_model'])}"
+               placeholder="可留空"></div>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <div style="width:150px"><label>单次输出上限 tokens</label>
+        <input type="number" name="max_output_tokens" min="512" max="200000"
+               value="{esc(cfg.get('llm_max_output_tokens') or 8000)}"></div>
+      <div style="width:150px"><label>分批文件数</label>
+        <input type="number" name="review_chunk_files" min="0" max="500"
+               value="{esc(cfg.get('review_chunk_files'))}"></div>
+      <div style="width:170px"><label>分批字符上限</label>
+        <input type="number" name="max_chars_per_chunk" min="10000" max="2000000"
+               value="{esc(cfg.get('max_chars_per_chunk') or 120000)}"></div>
+      <div style="width:150px"><label>清空 API Key</label>
+        <select name="clear_key"><option value="">否</option><option value="1">是，清空</option></select></div>
+    </div>
+    <div class="row" style="margin-top:14px">
+      <button class="btn primary" type="submit">保存</button>
+      <button class="btn" type="button"
+              onclick="provRun('/api/provider/models', this)">获取模型列表</button>
+      <button class="btn" type="button"
+              onclick="provRun('/api/provider/test', this)">测试连通性</button>
+      <span class="hint">保存后守护进程会自动重载配置，不用重启</span>
+    </div>
+  </form>
+  <div class="out" id="provout"></div>
+  <div class="sub" style="margin-top:10px">当前生效：{esc(B.effective_model_desc())}</div>
+  <div class="hint">也支持命令行：<code>python bot.py model --base-url … --api-key … --set …</code>
+    · <code>python bot.py model --list</code> · <code>python bot.py model --test</code></div>
+</div>
+"""
+
+
 def page_dashboard(flash: str = "", err: bool = False) -> str:
     ts = tasks()
     c = counts()
@@ -241,24 +384,6 @@ def page_dashboard(flash: str = "", err: bool = False) -> str:
 </div>
 
 <div class="card">
-  <h2>审核模型</h2>
-  <form method="post" action="/action" class="row" style="align-items:flex-end">
-    <input type="hidden" name="csrf" value="{CSI}">
-    <input type="hidden" name="action" value="model">
-    <div style="flex:1;min-width:260px"><label>模型（留空 = 用 pi 默认）</label>
-      <input type="text" name="model" value="{esc(B.CONFIG.get('pi_model') or '')}"
-             placeholder="deepseek/deepseek-v4-pro"></div>
-    <div style="width:150px"><label>thinking</label>
-      <select name="thinking">{"".join(
-        f'<option value="{lvl}"{" selected" if (B.CONFIG.get("pi_thinking") or "") == lvl else ""}>'
-        f'{lvl or "（默认）"}</option>'
-        for lvl in ("", "off", "minimal", "low", "medium", "high", "xhigh", "max"))}</select></div>
-    <button class="btn primary" type="submit">保存</button>
-  </form>
-  <div class="sub" style="margin-top:10px">当前生效：{esc(B.effective_model_desc())}</div>
-</div>
-
-<div class="card">
   <h2>全局审核要求（对所有任务生效）</h2>
   <form method="post" action="/action">
     <input type="hidden" name="csrf" value="{CSI}">
@@ -269,7 +394,8 @@ def page_dashboard(flash: str = "", err: bool = False) -> str:
   </form>
 </div>
 """
-    body = f'<div class="grid">{stats}</div>{controls}<div class="card"><h2>任务列表</h2>{table}</div>'
+    body = (f'<div class="grid">{stats}</div>{controls}{card_provider()}'
+            f'<div class="card"><h2>任务列表</h2>{table}</div>')
     return layout("控制台", body, refresh=20, flash=flash, flash_err=err)
 
 
@@ -418,6 +544,63 @@ def spawn_detached(*args):
                      stdin=subprocess.DEVNULL, creationflags=flags)
 
 
+def form_flat(form: dict) -> dict:
+    """parse_qs 的 {k: [v]} 拉成 {k: v}"""
+    return {k: v[0] for k, v in form.items() if v}
+
+
+def provider_cfg_from_form(form: dict) -> dict:
+    """用表单里（可能还没保存的）值临时搭一份 provider 配置，用于“先测再说”"""
+    cfg = dict(B.CONFIG)
+    f = form_flat(form)
+    base = (f.get("base_url") or "").strip()
+    proto = (f.get("protocol") or "").strip()
+    if base:
+        cfg["llm_base_url"] = base
+        cfg["llm_protocol"] = proto or (B.LLM.suggest_protocol(base) if B.LLM else "openai")
+    elif proto:
+        cfg["llm_protocol"] = proto
+    key = (f.get("api_key") or "").strip()
+    if key:
+        cfg["llm_api_key"] = key
+    if f.get("clear_key"):
+        cfg["llm_api_key"] = ""
+    if f.get("model"):
+        cfg["llm_model"] = f["model"].strip()
+    if f.get("thinking"):
+        cfg["llm_thinking"] = f["thinking"].strip()
+    if f.get("max_output_tokens"):
+        try:
+            cfg["llm_max_output_tokens"] = int(f["max_output_tokens"])
+        except ValueError:
+            pass
+    cfg["llm_backend"] = "http"
+    return cfg
+
+
+def api_provider(op: str, form: dict) -> dict:
+    if B.LLM is None:
+        return {"error": "lib/llm.py 缺失"}
+    cfg = provider_cfg_from_form(form)
+    if not (cfg.get("llm_base_url") or "").strip():
+        return {"error": "先填 Base URL（例如 https://api.deepseek.com）"}
+    p = B.LLM.Provider(cfg)
+    if op == "models":
+        try:
+            ms = p.list_models()
+        except Exception as e:
+            return {"error": f"获取模型列表失败：{e}\n当前配置：{p.describe()}"}
+        if not ms:
+            return {"error": "该服务没返回模型列表（有些自建网关不提供 /models，直接手填模型名）"}
+        return {"models": ms,
+                "message": f"{p.base_url} 返回 {len(ms)} 个模型；选中后点「保存」"}
+    if op == "test":
+        r = p.test()
+        return {"ok": r["ok"], "message": r["message"], "base_url": r["base_url"],
+                "model": r["model"], "count": len(r["models"])}
+    return {"error": f"未知操作: {op}"}
+
+
 def do_action(form: dict) -> tuple:
     """返回 (flash_message, is_error, redirect)"""
     a = (form.get("action") or [""])[0]
@@ -442,12 +625,13 @@ def do_action(form: dict) -> tuple:
         return (f"已保存任务要求 {mid[-8:]}", False, f"/task/{mid}") if rc == 0 \
             else (f"保存失败: {out[:300]}", True, f"/task/{mid}")
 
-    if a == "model":
-        model = (form.get("model") or [""])[0].strip()
-        thinking = (form.get("thinking") or [""])[0].strip()
-        rc, out = run_bot_cli("model", "--set", model, "--thinking", thinking)
+    if a in ("provider", "model"):
+        err = B.apply_provider(form_flat(form))
+        if err:
+            return (f"配置未保存：{err}", True, "/")
+        B.reload_config()
         reload_config()
-        return ("模型配置已更新", False, "/") if rc == 0 else (f"更新失败: {out[:300]}", True, "/")
+        return (f"模型配置已保存：{B.effective_model_desc()}", False, "/")
 
     if a == "global_req":
         val = (form.get("value") or [""])[0]
@@ -511,6 +695,7 @@ class Handler(BaseHTTPRequestHandler):
                     "pids": daemon_pids(),
                     "config_source": B.CONFIG.get("_source"),
                     "model": B.effective_model_desc(),
+                    "provider": B.provider_status(),
                     "counts": counts(),
                     "tasks": [
                         {k: t.get(k) for k in
@@ -562,6 +747,15 @@ class Handler(BaseHTTPRequestHandler):
         if (form.get("csrf") or [""])[0] != CSI:
             return self._send(403, layout("CSRF", '<div class="card">CSRF 校验失败，请刷新页面重试</div>',
                                           flash="CSRF 校验失败", flash_err=True))
+        path = urllib.parse.unquote(urllib.parse.urlparse(self.path).path)
+        if path.startswith("/api/provider/"):
+            op = path.split("/api/provider/", 1)[1]
+            try:
+                out = api_provider(op, form)
+            except Exception as e:
+                out = {"error": f"执行异常：{e}"}
+            return self._send(200, json.dumps(out, ensure_ascii=False),
+                              "application/json; charset=utf-8")
         try:
             msg, is_err, to = do_action(form)
         except Exception as e:

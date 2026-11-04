@@ -251,7 +251,78 @@ SEEN ──► DOWNLOADED ──► REVIEWED ──► REPLIED   (终态，永�
 | `max_extracted_mb` | `300` | 单包解压体积上限 |
 | `max_review_files` | `400` | 送审文件数上限 |
 | `review_timeout_sec` | `2400` | 单次 AI 审核超时 |
-| `pi_model` | 空 | 指定审核模型（留空用 pi 默认） |
+| `pi_model` | 空 | 指定审核模型（仅 pi 后端） |
+
+---
+
+## 六之二、模型接入（通用 Provider，不依赖任何本地 CLI）
+
+审核能力默认走**直连模型服务**：只要给 `base_url + api_key + model` 就能跑。
+不装 pi、不在开发机上也能跑；DeepSeek / OpenAI / Moonshot / 智谱 / OpenRouter /
+vLLM·LiteLLM·OneAPI 自建网关 / 本机 Ollama 都可以。
+
+```bash
+# 一条命令配好（base_url 会自动补 /v1，粘贴完整接口路径也能识别）
+python bot.py model --base-url https://api.deepseek.com --api-key sk-xxx --set deepseek-chat
+
+python bot.py model --list      # 拉取该服务的模型列表（GET /v1/models）
+python bot.py model --test      # 连通性自检：列模型 + 真发一次对话
+python bot.py model --thinking high
+python bot.py model --fallback deepseek-chat   # 上游繁忙时自动切换
+python bot.py model             # 看当前生效的后端/模型/掩码密钥
+```
+
+**Web 控制台**（`python bot.py ui` → http://127.0.0.1:8770）里有「模型接入」卡片：
+填 Base URL、选协议、填 API Key，点「**获取模型列表**」直接选模型，点「**测试连通性**」
+当场验证；保存后守护进程**自动重载配置，不用重启**。
+
+| 配置项 | 默认 | 说明 |
+|--------|------|------|
+| `llm_backend` | `auto` | `auto`：填了 base_url 就直连，否则用 pi；可强制 `http` / `pi` |
+| `llm_protocol` | `openai` | `openai`（`/v1/chat/completions`）/ `anthropic`（`/v1/messages`）/ `ollama`（`/api/chat`） |
+| `llm_base_url` | 空 | 例 `https://api.deepseek.com`、`http://127.0.0.1:11434`、`https://gw.example.com/v1` |
+| `llm_api_key` | 空 | 留空时可用环境变量 `CODE_REVIEW_BOT_API_KEY`（不想落盘就用它） |
+| `llm_model` | 空 | 模型原名（`deepseek-chat`、`gpt-4o-mini`、`qwen2.5-coder:7b`…） |
+| `llm_thinking` | 空 | `off/minimal/low/medium/high/xhigh/max`，自动翻译成各家写法 |
+| `llm_temperature` | `0.2` | 采样温度 |
+| `llm_max_output_tokens` | `8000` | 单次输出上限；被截断会自动续写一次 |
+| `llm_timeout_sec` | `600` | 单次请求超时 |
+| `llm_extra_body` | `{}` | 透传服务商自定义字段（如 `{"thinking":{"type":"enabled"}}`） |
+| `llm_headers` | `{}` | 自定义请求头（网关租户、路由标签等） |
+| `review_chunk_files` / `max_chars_per_chunk` | `40` / `120000` | 分批上限：**文件数**与**正文字符数**双约束 |
+| `fallback_model` | 空 | 上游 503/限流时自动换这个模型重试一次 |
+
+### 直连后端怎么审（和 pi 后端的区别）
+
+pi 后端让模型自己用 read/ls 工具翻代码；直连后端不依赖工具：
+机器人**自己读文件**，把正文以 `行号 | 代码` 的形式给模型——
+
+```
+### FILE: app/main.py（共 128 行）
+1 | import os
+2 | API_KEY = "sk-..."
+```
+
+行号显式给出，模型引用行号时不用猜，也就没法编造；单文件超过
+`max_file_chars` 会截断并写明「仅给出前 N 行」。
+
+### 错误都会被翻译成人话
+
+| 现象 | 你会看到 |
+|------|---------|
+| 401 / 403 | 「API Key 无效或未提供」/「无权访问该模型，确认已开通、额度未用完」 |
+| 404 | 「找不到该模型或接口路径不对」——并提示先点「获取模型列表」 |
+| 400 上下文超限 | 「prompt 超出模型上下文，可调小 review_chunk_files / max_chars_per_chunk」 |
+| 429 / 5xx / 超时 / 流被掐 | 判定为**上游繁忙**：自动退避（默认 900s），有 `fallback_model` 就自动换 |
+| 模型返回空 | 直接判失败，不会发一份空报告 |
+
+### 密钥安全
+
+- 密钥只写进 `config.json`，该文件已在 `.gitignore` 里，**不会进仓库**；
+- 不想落盘：用环境变量 `CODE_REVIEW_BOT_API_KEY`；
+- 日志 / 控制台 / `/api/status` 里一律只出现掩码（`sk-T***7890`）；
+- 回复正文与报告经过 `redact()`，连「本机器人自己的密钥」都会被掩掉；
+- 有回归测试锁住这些行为（`test_llm.py`、`test_ui.py`）。
 
 ---
 
