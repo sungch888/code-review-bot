@@ -297,6 +297,32 @@ def main():
                   "获取模型列表" in body and "测试可用性" in body and 'id="modelpick"' in body,
                   body[:150])
             check("表单 id=provform 供 provRun 取值", 'id="provform"' in body and 'id="provout"' in body)
+
+            # 关键回归：编辑时测试要用「该配置自己的 key」，不是顶层/激活项的 key
+            B.CONFIG["providers"] = {
+                "pA": {"base_url": "https://api.a.com", "protocol": "openai",
+                       "api_key": "sk-AAAA-1111", "model": "ma"},
+                "pB": {"base_url": "https://api.b.com", "protocol": "openai",
+                       "api_key": "sk-BBBB-2222", "model": "mb"},
+            }
+            B.CONFIG["llm_api_key"] = "sk-AAAA-1111"   # 顶层= pA 的 key
+            B.CONFIG["active_provider"] = "pA"
+            cfg = ui.provider_cfg_from_form({
+                "base_url": ["https://api.b.com"], "protocol": ["openai"],
+                "model": ["mb"], "old_name": ["pB"], "api_key": [""]})
+            check("编辑 pB 用 pB 自己的 key（而非顶层 pA key）",
+                  cfg["llm_api_key"] == "sk-BBBB-2222", cfg["llm_api_key"])
+            cfg2 = ui.provider_cfg_from_form({
+                "base_url": ["https://api.b.com"], "protocol": ["openai"],
+                "old_name": ["pB"], "api_key": ["sk-NEW-9999"]})
+            check("编辑时填了新 key 优先用新的", cfg2["llm_api_key"] == "sk-NEW-9999",
+                  cfg2["llm_api_key"])
+            cfg3 = ui.provider_cfg_from_form({
+                "base_url": ["https://api.x.com"], "protocol": ["openai"],
+                "api_key": ["sk-NEWX"], "model": ["mx"]})
+            check("新增模式用表单填的 key", cfg3["llm_api_key"] == "sk-NEWX",
+                  cfg3["llm_api_key"])
+
             # 新增 alpha（激活）
             st, hdr, _ = post("/action", {"action": "create_provider", "csrf": ui.CSI,
                                           "name": "alpha", "base_url": "https://api.alpha.example",

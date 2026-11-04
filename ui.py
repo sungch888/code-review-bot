@@ -846,6 +846,13 @@ def provider_cfg_from_form(form: dict) -> dict:
     key = (f.get("api_key") or "").strip()
     if key:
         cfg["llm_api_key"] = key
+    elif f.get("old_name") or f.get("provider_name"):
+        # 编辑模式：表单 key 留空 = 用「正在编辑的这套配置」存的原 key，
+        # 而不是当前顶层 key（否则编辑非激活配置时会用错 key、测试必挂）
+        ref = f.get("old_name") or f.get("provider_name")
+        e = B.get_provider(ref) or {}
+        if e.get("api_key"):
+            cfg["llm_api_key"] = e["api_key"]
     if f.get("clear_key"):
         cfg["llm_api_key"] = ""
     if f.get("model"):
