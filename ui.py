@@ -170,10 +170,12 @@ footer{color:var(--dim);font-size:12px;margin-top:34px;border-top:1px solid var(
 
 # 模型服务面板用的前端脚本（单文件、零依赖，不拉外部 JS）
 PROV_FIELDS = ["backend", "base_url", "protocol", "api_key", "model", "thinking",
-               "fallback", "max_output_tokens", "max_chars_per_chunk", "review_chunk_files"]
+               "fallback", "max_output_tokens", "max_chars_per_chunk", "review_chunk_files",
+               "old_name", "name"]
 PROV_JS = """
 var PROV_FIELDS = ["backend","base_url","protocol","api_key","model","thinking",
-                   "fallback","max_output_tokens","max_chars_per_chunk","review_chunk_files"];
+                   "fallback","max_output_tokens","max_chars_per_chunk","review_chunk_files",
+                   "old_name","name"];
 function provParams(){
   var f = document.getElementById('provform');
   var p = new URLSearchParams();

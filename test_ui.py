@@ -9,6 +9,7 @@
 """
 import http.client
 import json
+import re
 import sys
 import threading
 import urllib.parse
@@ -297,6 +298,9 @@ def main():
                   "获取模型列表" in body and "测试可用性" in body and 'id="modelpick"' in body,
                   body[:150])
             check("表单 id=provform 供 provRun 取值", 'id="provform"' in body and 'id="provout"' in body)
+            # 前端 PROV_FIELDS 必须带 old_name，否则编辑时测试拿不到该配置自己的 key
+            check("PROV_JS 的 PROV_FIELDS 包含 old_name（编辑测试需携带配置引用）",
+                  re.search(r'PROV_FIELDS\s*=\s*\[[^\]]*old_name', body) is not None)
 
             # 关键回归：编辑时测试要用「该配置自己的 key」，不是顶层/激活项的 key
             B.CONFIG["providers"] = {
