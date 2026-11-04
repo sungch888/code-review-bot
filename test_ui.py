@@ -293,6 +293,10 @@ def main():
             st, _, body = get("/model?new=1")
             check("新增表单出现且是 create_provider", "新增模型配置" in body
                   and 'value="create_provider"' in body and 'name="name"' in body, body[:150])
+            check("新增表单有「获取模型列表/测试可用性」按钮",
+                  "获取模型列表" in body and "测试可用性" in body and 'id="modelpick"' in body,
+                  body[:150])
+            check("表单 id=provform 供 provRun 取值", 'id="provform"' in body and 'id="provout"' in body)
             # 新增 alpha（激活）
             st, hdr, _ = post("/action", {"action": "create_provider", "csrf": ui.CSI,
                                           "name": "alpha", "base_url": "https://api.alpha.example",

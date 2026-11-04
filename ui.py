@@ -178,6 +178,7 @@ function provParams(){
   var f = document.getElementById('provform');
   var p = new URLSearchParams();
   p.set('csrf', CSRF);
+  if (!f) return p;
   PROV_FIELDS.forEach(function(k){ var el = f.elements[k]; if (el && el.value !== '') p.set(k, el.value); });
   return p;
 }
@@ -422,7 +423,7 @@ def provider_form(mode: str, name: str = "") -> str:
     return f"""
 <div class="card" style="border:1px solid #5b8cff">
   <h2>{title}</h2>
-  <form method="post" action="/action">
+  <form method="post" action="/action" id="provform">
     <input type="hidden" name="csrf" value="{CSI}">
     <input type="hidden" name="action" value="{action}">
     {'<input type="hidden" name="old_name" value="' + esc(name) + '">' if is_edit else ""}
@@ -446,10 +447,14 @@ def provider_form(mode: str, name: str = "") -> str:
     </div>
     <div class="row">
       <div style="flex:2;min-width:240px"><label>模型名</label>
-        <input type="text" name="model" value="{esc(e.get('model') or '')}"
+        <input type="text" id="model" name="model" value="{esc(e.get('model') or '')}"
                placeholder="deepseek-chat / gpt-4o-mini / qwen2.5-coder:7b"></div>
       <div style="width:180px"><label>思考强度</label>
         <select name="thinking">{opts([(l, l or "默认") for l in levels], e.get('thinking') or '')}</select></div>
+    </div>
+    <div class="row" style="display:none" id="pickbox">
+      <div style="flex:2;min-width:240px"><label>从服务拉到的模型（选它会自动填到上面）</label>
+        <select id="modelpick"></select></div>
     </div>
     <div class="row">
       <div style="width:190px"><label>单次输出上限 tokens</label>
@@ -462,7 +467,13 @@ def provider_form(mode: str, name: str = "") -> str:
         <input type="text" name="fallback" value="{esc(B.CONFIG.get('fallback_model') or '')}"
                placeholder="可留空"></div>
     </div>
-    <div class="row" style="margin-top:16px">
+    <div class="row" style="margin-top:14px">
+      <button class="btn" type="button" onclick="provRun('/api/provider/models', this)">获取模型列表</button>
+      <button class="btn" type="button" onclick="provRun('/api/provider/test', this)">测试可用性</button>
+      <span class="hint">用你当前填的 Base URL / Key / 协议试，不用先保存</span>
+    </div>
+    <div class="out" id="provout"></div>
+    <div class="row" style="margin-top:14px">
       <button class="btn primary" type="submit" name="activate" value="1">保存并激活</button>
       <button class="btn" type="submit">仅保存</button>
       <a class="btn" href="/model">取消</a>
