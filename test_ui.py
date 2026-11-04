@@ -149,6 +149,15 @@ def main():
 
         # 测试会改 config.json，先备份，最后原样还原
         cfg_backup = (BASE / "config.json").read_text(encoding="utf-8")
+        # 把模型相关字段重置为干净状态，测试才有确定性（否则依赖用户当前配了哪个后端）
+        _orig = json.loads(cfg_backup)
+        for _f in ("llm_base_url", "llm_api_key", "llm_model", "llm_protocol",
+                   "llm_thinking", "pi_model", "pi_thinking", "fallback_model"):
+            _orig[_f] = ""
+        _orig["llm_backend"] = "auto"
+        (BASE / "config.json").write_text(json.dumps(_orig, ensure_ascii=False, indent=2),
+                                          encoding="utf-8")
+        B.reload_config()
 
         # 6. 动作：model 保存后可读回
         st, hdr, _ = post("/action", {"action": "model", "csrf": ui.CSI,

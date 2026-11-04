@@ -24,6 +24,7 @@ import sys
 import threading
 import urllib.parse
 import webbrowser
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -294,8 +295,42 @@ def badge(state: str) -> str:
             f'{esc(state)}</span>')
 
 
-def fmt_time(iso: str) -> str:
-    return esc((iso or "").replace("T", " ")[:19])
+def _to_local(val):
+    """把各种时间表示统一解析成**本地时间** datetime。
+
+    支持：
+      - Unix 时间戳（int/float，如 1793677985）
+      - ISO 字符串带 `Z`（UTC）：2026-11-03T03:53:03Z
+      - ISO 字符串带偏移：2026-11-03T11:53:05+08:00
+      - 无时区的 ISO 字符串：按本地时间处理
+    解析失败返回 None。
+    """
+    if val is None or val == "":
+        return None
+    if isinstance(val, (int, float)):
+        try:
+            return datetime.fromtimestamp(val)   # fromtimestamp 默认就是本地
+        except Exception:
+            return None
+    s = str(val).strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"          # fromisoformat 不认 Z（旧版 Python）
+    try:
+        dt = datetime.fromisoformat(s)
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        return dt                      # 无时区 -> 已是本地
+    return dt.astimezone()            # 有时区 -> 转本地
+
+
+def fmt_time(val) -> str:
+    """统一显示为本地时间（邮箱的 UTC 字段 / 机器人的本地字段 / 时间戳都一样）"""
+    dt = _to_local(val)
+    if dt is not None:
+        return esc(dt.strftime("%Y-%m-%d %H:%M:%S"))
+    # 兜底：无法解析就原样截断，至少不炸
+    return esc((str(val) if val else "").replace("T", " ")[:19])
 
 
 # ---------------------------------------------------------------- 页面：控制台

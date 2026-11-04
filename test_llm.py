@@ -362,7 +362,10 @@ check("provider_status 不含密钥原文", "sk-FAKE-NOT-REAL-0001" not in json.
 # ---------- 9. 配置校验 / 保存语义 ----------
 B.CONFIG.clear()
 B.CONFIG.update(old_cfg)
+# 这些校验测试需要一个受控的干净状态（别依赖用户当前配了什么模型）
 B.CONFIG["llm_base_url"] = ""
+B.CONFIG["llm_model"] = ""
+B.CONFIG["pi_model"] = ""
 B.CONFIG["llm_api_key"] = "sk-FAKE-NOT-REAL-0003"
 check("http 后端缺 base_url 被拦住",
       "Base URL" in B.validate_provider("http", None, None, "m", ""),
