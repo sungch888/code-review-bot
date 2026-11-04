@@ -18,6 +18,7 @@ import argparse
 import html
 import json
 import os
+import re
 import secrets
 import subprocess
 import sys
@@ -358,11 +359,62 @@ def card_provider(src: str = "/") -> str:
                        f'{" selected" if v == cur else ""}>{esc(lbl)}</option>'
                        for v, lbl in pairs)
 
+    # ---- 命名配置：随时切换，不用再填 ----
+    provs = st.get("providers") or []          # [(name, desc), ...]
+    active = st.get("active_provider") or ""
+    url_host = (cfg.get("llm_base_url") or "").split("://")[-1].split("/")[0].split(":")[0]
+    suggested = re.sub(r"[^A-Za-z0-9_.\-]", "", url_host)[:40] or "default"
+    if provs:
+        rows = []
+        for name, desc in provs:
+            mark = ' <span class="state ok">● 当前</span>' if name == active else ""
+            rows.append(f"""
+    <div class="row" style="align-items:center;margin:6px 0">
+      <div style="flex:2;min-width:200px"><b>{esc(name)}</b>{mark}
+        <div class="sub mono">{esc(desc)}</div></div>
+      <form method="post" action="/action" style="margin:0">
+        <input type="hidden" name="csrf" value="{CSI}">
+        <input type="hidden" name="action" value="switch_provider">
+        <input type="hidden" name="profile_name" value="{esc(name)}">
+        <button class="btn" type="submit">切换</button>
+      </form>
+      <form method="post" action="/action" style="margin:0"
+            onsubmit="return confirm('删除配置 {esc(name)}？（不影响当前生效值）')">
+        <input type="hidden" name="csrf" value="{CSI}">
+        <input type="hidden" name="action" value="delete_provider">
+        <input type="hidden" name="profile_name" value="{esc(name)}">
+        <button class="btn danger" type="submit">删除</button>
+      </form>
+    </div>""")
+        prov_list = "".join(rows)
+        prov_empty = ""
+    else:
+        prov_list = ""
+        prov_empty = ('<div class="hint" style="margin:6px 0">还没有保存的命名配置。'
+                     '填好下面的 Base URL / Key / 模型后，点「存为命名配置」就能随时切回来，不用再输。</div>')
+    profiles_block = f"""
+  <div class="card" style="background:#f4f6fb;margin-bottom:14px">
+    <h3 style="margin:2px 0 6px">↺ 已保存的命名配置（随时切换，不用再填）</h3>
+    {prov_list}
+    {prov_empty}
+    <form method="post" action="/action" class="row" style="align-items:flex-end;margin-top:8px">
+      <input type="hidden" name="csrf" value="{CSI}">
+      <input type="hidden" name="action" value="save_provider">
+      <div style="flex:2;min-width:220px"><label>把当前配置存为命名配置</label>
+        <input type="text" name="profile_name" value="{esc(suggested)}"
+               placeholder="起个名字，如 deepseek / local-165 / gpt"></div>
+      <button class="btn primary" type="submit">存为命名配置</button>
+    </form>
+  </div>
+"""
+
     return f"""
 <div class="card">
   <h2>模型接入（三步就能跑）</h2>
   <div class="hint">给 <b>Base URL + API Key + 模型名</b> 就能审核，不依赖本机装了什么 CLI。
     支持 DeepSeek / OpenAI / Moonshot / 智谱 / OpenRouter / vLLM·LiteLLM·OneAPI 自建网关 / 本机 Ollama。</div>
+
+  {profiles_block}
 
   <form method="post" action="/action" id="provform">
     <input type="hidden" name="csrf" value="{CSI}">
@@ -579,7 +631,16 @@ def page_dashboard(flash: str = "", err: bool = False) -> str:
   </form>
 </div>"""
 
-    body = (f'<div class="grid">{stats}</div>{approval_section}{controls}{approval_cfg}{card_provider()}'
+    model_link = f"""
+<div class="card">
+  <h2>审核模型</h2>
+  <div class="row" style="align-items:center">
+    <div style="flex:2;min-width:220px"><span class="mono">{esc(B.effective_model_desc())}</span>
+      <div class="sub">命名配置 / 切换 / 新增都在模型页</div></div>
+    <a class="btn primary" href="/model">配置模型 / 命名配置</a>
+  </div>
+</div>"""
+    body = (f'<div class="grid">{stats}</div>{approval_section}{controls}{model_link}{approval_cfg}'
             f'<div class="card"><h2>任务列表</h2>{table}</div>')
     return layout("控制台", body, refresh=20, flash=flash, flash_err=err)
 
@@ -913,6 +974,30 @@ def do_action(form: dict) -> tuple:
         B.reload_config()
         reload_config()
         return ("审批 / 确认信设置已保存", False, "/")
+
+    if a == "switch_provider":
+        name = (form.get("profile_name") or [""])[0]
+        err = B.switch_provider(name)
+        if err:
+            return (f"切换失败：{err}", True, "/")
+        B.reload_config(); reload_config()
+        return (f"已切换到「{name}」：{B.effective_model_desc()}", False, "/")
+
+    if a == "save_provider":
+        name = (form.get("profile_name") or [""])[0]
+        err = B.save_provider(name)
+        if err:
+            return (f"保存命名配置失败：{err}", True, "/")
+        B.reload_config(); reload_config()
+        return (f"已把当前配置存为「{name}」（现在是当前生效配置）", False, "/")
+
+    if a == "delete_provider":
+        name = (form.get("profile_name") or [""])[0]
+        err = B.delete_provider(name)
+        if err:
+            return (f"删除失败：{err}", True, "/")
+        B.reload_config(); reload_config()
+        return (f"已删除命名配置「{name}」（当前生效值不受影响）", False, "/")
 
     if a in ("provider", "model"):
         err = B.apply_provider(form_flat(form))

@@ -1956,6 +1956,122 @@ def validate_provider(backend: str = None, base_url: str = None,
     return ""
 
 
+# ---------------------------------------------------------------- provider 命名配置
+PROVIDER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,63}$")
+
+
+def list_providers() -> list:
+    """[(name, brief_desc), ...]，按名字排序"""
+    provs = CONFIG.get("providers") or {}
+    out = []
+    for name, v in provs.items():
+        if not isinstance(v, dict):
+            continue
+        desc = f"{v.get('model') or '?'} @ {v.get('base_url') or '?'}"
+        if v.get("api_key"):
+            desc += f" (key {LLM.mask_key(v['api_key'])})"
+        out.append((name, desc))
+    return sorted(out, key=lambda x: x[0])
+
+
+def get_active_provider() -> str:
+    return (CONFIG.get("active_provider") or "").strip()
+
+
+def _snapshot_to_top() -> dict:
+    """把当前顶层 llm_* 存为一个 entry（用于 providers[name]）"""
+    return {
+        "base_url": CONFIG.get("llm_base_url", "") or "",
+        "protocol": CONFIG.get("llm_protocol", "openai") or "openai",
+        "api_key": CONFIG.get("llm_api_key", "") or "",
+        "model": CONFIG.get("llm_model", "") or "",
+        "thinking": CONFIG.get("llm_thinking", "") or "",
+        "max_output_tokens": CONFIG.get("llm_max_output_tokens") or 8000,
+        "temperature": CONFIG.get("llm_temperature", 0.2),
+    }
+
+
+def _top_from_entry(v: dict) -> dict:
+    """把 entry 展开为顶层 llm_* 字段"""
+    m = {
+        "llm_base_url": v.get("base_url", "") or "",
+        "llm_protocol": v.get("protocol", "openai") or "openai",
+        "llm_api_key": v.get("api_key", "") or "",
+        "llm_model": v.get("model", "") or "",
+        "llm_thinking": v.get("thinking", "") or "",
+    }
+    try:
+        m["llm_max_output_tokens"] = int(v.get("max_output_tokens") or 8000)
+    except (TypeError, ValueError):
+        m["llm_max_output_tokens"] = 8000
+    try:
+        m["llm_temperature"] = float(v.get("temperature", 0.2))
+    except (TypeError, ValueError):
+        m["llm_temperature"] = 0.2
+    return m
+
+
+def save_provider(name: str, save: bool = True) -> str:
+    """把当前顶层 llm_* 存为命名配置（可选设为 active）"""
+    name = (name or "").strip()
+    if not name:
+        return "配置名不能为空"
+    if not PROVIDER_NAME_RE.match(name):
+        return "配置名只能由字母/数字开头，后续可含 _ . -，长度 ≤ 64"
+    if not (CONFIG.get("llm_base_url") or CONFIG.get("llm_model")):
+        return "当前还没有可保存的模型配置（先填 Base URL / 模型）"
+    entry = _snapshot_to_top()
+    provs = CONFIG.get("providers") or {}
+    provs[name] = entry
+    CONFIG["providers"] = provs
+    CONFIG["active_provider"] = name
+    if save:
+        _save_config()
+    return ""
+
+
+def switch_provider(name: str, save: bool = True) -> str:
+    """切换到命名配置（把 entry 展开到顶层）"""
+    name = (name or "").strip()
+    provs = CONFIG.get("providers") or {}
+    if name not in provs:
+        avail = ", ".join(sorted(provs)) or "（无）"
+        return f"配置 {name!r} 不存在。现有：{avail}"
+    CONFIG.update(_top_from_entry(provs[name]))
+    CONFIG["active_provider"] = name
+    if save:
+        _save_config()
+    return ""
+
+
+def delete_provider(name: str, save: bool = True) -> str:
+    name = (name or "").strip()
+    provs = CONFIG.get("providers") or {}
+    if name not in provs:
+        return f"配置 {name!r} 不存在"
+    del provs[name]
+    CONFIG["providers"] = provs
+    if (CONFIG.get("active_provider") or "") == name:
+        CONFIG["active_provider"] = ""
+    if save:
+        _save_config()
+    return ""
+
+
+def migrate_legacy_provider(save: bool = True) -> str:
+    """首次升级：如果顶层有 llm_* 但 providers 还是空的，自动存为 “default”。"""
+    provs = CONFIG.get("providers") or {}
+    if provs:
+        return ""
+    if not (CONFIG.get("llm_base_url") or CONFIG.get("llm_model")):
+        return ""
+    err = save_provider("default", save=save)
+    if not err and save:
+        log("已把现有顶层模型配置存为命名配置 default")
+    return err
+
+
+# ---------------------------------------------------------------- provider 应用（表单字段 -> 顶层）
 def apply_provider(fields: dict, save: bool = True) -> str:
     """把 UI/脚本传来的字段写进配置；返回错误描述（空串 = 成功）
 
@@ -2021,7 +2137,9 @@ def provider_status() -> dict:
            "thinking": "", "temperature": None, "max_output_tokens": None,
            "fallback_model": (CONFIG.get("fallback_model") or "").strip(),
            "pi_model": CONFIG.get("pi_model") or "",
-           "pi_thinking": CONFIG.get("pi_thinking") or ""}
+           "pi_thinking": CONFIG.get("pi_thinking") or "",
+           "active_provider": get_active_provider(),
+           "providers": list_providers()}
     if LLM is None:
         out["error"] = "lib/llm.py 缺失"
         return out

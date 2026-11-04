@@ -187,10 +187,10 @@ def main():
               B.CONFIG.get("review_requirements"))
         post("/action", {"action": "global_req", "csrf": ui.CSI, "value": ""})
 
-        # 7.5 模型接入（provider 卡片 / 列表 / 测试 / 保存）
+        # 7.5 模型接入（卡片在 /model 页 / 列表 / 测试 / 保存）
         try:
-            st, _, body = get("/")
-            check("控制台有模型接入卡片", 'name="base_url"' in body and "获取模型列表" in body,
+            st, _, body = get("/model")
+            check("/model 页有模型接入卡片", 'name="base_url"' in body and "获取模型列表" in body,
                   body[:120])
             check("卡片不暴露已保存的密钥原文",
                   (B.CONFIG.get("llm_api_key") or "zz") not in body)
@@ -273,7 +273,42 @@ def main():
             check("控制台改用可暂停的 JS 刷新", "REFRESH_SEC = 20" in body and "formBusy" in body,
                   body[-250:])
             check("控制台会提示「正在输入，自动刷新已暂停」", "自动刷新已暂停" in body)
-            check("控制台也有模型接入卡片", 'id="provform"' in body)
+            check("控制台改用模型入口(不再放完整配置卡片)",
+                  'href="/model"' in body and 'id="provform"' not in body)
+
+            # 命名配置：保存 / 切换 / 删除（全走真实动作，但用假 key、不联网）
+            post("/action", {"action": "provider", "csrf": ui.CSI,
+                             "base_url": "https://api.alpha.example",
+                             "api_key": "sk-FAKE-ALPHA-0001", "model": "alpha-model"})
+            st, hdr, _ = post("/action", {"action": "save_provider", "csrf": ui.CSI,
+                                          "profile_name": "alpha"})
+            check("保存命名配置 alpha 成功", st == 303, st)
+            check("alpha 进入 providers", "alpha" in (B.CONFIG.get("providers") or {}))
+            post("/action", {"action": "provider", "csrf": ui.CSI,
+                             "base_url": "https://api.beta.example",
+                             "api_key": "sk-FAKE-BETA-0002", "model": "beta-model"})
+            post("/action", {"action": "save_provider", "csrf": ui.CSI, "profile_name": "beta"})
+            st, hdr, _ = post("/action", {"action": "switch_provider", "csrf": ui.CSI,
+                                          "profile_name": "alpha"})
+            check("切换到 alpha", st == 303, st)
+            check("切换后生效模型是 alpha-model", B.CONFIG.get("llm_model") == "alpha-model",
+                  B.CONFIG.get("llm_model"))
+            check("active_provider = alpha", B.get_active_provider() == "alpha")
+            st, _, body = get("/model")
+            check("/model 页展示已保存的命名配置", "已保存的命名配置" in body and "alpha" in body
+                  and "beta" in body, body[:200])
+            check("/model 页有「存为命名配置」按钮", "存为命名配置" in body)
+            # 非法/不存在
+            st, hdr, _ = post("/action", {"action": "switch_provider", "csrf": ui.CSI,
+                                          "profile_name": "ghost"})
+            check("切换不存在的命名配置被拒", st == 303 and (hdr.get("Location") or "").startswith("/?m="), str(hdr))
+            st, hdr, _ = post("/action", {"action": "delete_provider", "csrf": ui.CSI,
+                                          "profile_name": "alpha"})
+            check("删除命名配置 alpha", st == 303 and "alpha" not in (B.CONFIG.get("providers") or {}), str(hdr))
+            # 收尾：把当前配置存为一个默认命名，避免影响用户真实配置
+            B.CONFIG["llm_model"] = "deepseek-chat"
+            B.save_provider("default")
+            B.switch_provider("default")
 
             st, hdr, _ = post("/action", {"action": "provider", "csrf": ui.CSI,
                                           "from": "/model", "model": "deepseek-chat"})
