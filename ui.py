@@ -18,7 +18,6 @@ import argparse
 import html
 import json
 import os
-import re
 import secrets
 import subprocess
 import sys
@@ -337,182 +336,149 @@ def fmt_time(val) -> str:
 
 
 # ---------------------------------------------------------------- 页面：控制台
-def card_provider(src: str = "/") -> str:
-    """模型接入卡片：填 Base URL + API Key + 模型 就能跑，不依赖任何本地 CLI"""
-    st = B.provider_status()
-    cfg = B.CONFIG
+def provider_list() -> str:
+    """模型配置列表：名称 / 模型 / Base URL / 状态 + 激活·编辑·删除"""
+    provs = B.list_providers()          # [(name, desc), ...]
+    active = B.get_active_provider()
+    if provs:
+        rows = []
+        for name, _desc in provs:
+            entry = B.get_provider(name) or {}
+            is_active = (name == active)
+            status = ('<span class="state ok">● 当前生效</span>' if is_active
+                      else '<span class="sub">—</span>')
+            if is_active:
+                act_btn = '<span class="sub" title="已是当前生效">✓</span>'
+            else:
+                act_btn = (
+                    f'<form method="post" action="/action" style="display:inline;margin:0">'
+                    f'<input type="hidden" name="csrf" value="{CSI}">'
+                    f'<input type="hidden" name="action" value="activate_provider">'
+                    f'<input type="hidden" name="name" value="{esc(name)}">'
+                    f'<button class="btn sm primary" type="submit">激活</button></form>')
+            edit_btn = f'<a class="btn sm" href="/model?edit={urllib.parse.quote(name)}">编辑</a>'
+            if is_active:
+                del_btn = ('<span class="sub" title="激活的配置不能删除">—</span>')
+            else:
+                del_btn = (
+                    f'<form method="post" action="/action" style="display:inline;margin:0" '
+                    f'onsubmit="return confirm(\'删除配置「{esc(name)}」？不可恢复\')">'
+                    f'<input type="hidden" name="csrf" value="{CSI}">'
+                    f'<input type="hidden" name="action" value="delete_provider">'
+                    f'<input type="hidden" name="name" value="{esc(name)}">'
+                    f'<button class="btn sm danger" type="submit">删除</button></form>')
+            rows.append(
+                f'<tr><td><b>{esc(name)}</b></td>'
+                f'<td>{esc(entry.get("model") or "—")}</td>'
+                f'<td class="mono">{esc(entry.get("base_url") or "—")}</td>'
+                f'<td>{status}</td>'
+                f'<td><div class="row" style="gap:6px">{act_btn}{edit_btn}{del_btn}</div></td></tr>')
+        body = "".join(rows)
+    else:
+        body = ('<tr><td colspan="5" class="hint">还没有模型配置。'
+                '点右上角「＋ 新增配置」添加第一个。</td></tr>')
+    return f"""
+<div class="card">
+  <div class="row" style="align-items:center;margin-bottom:6px">
+    <h2 style="margin:0">模型配置</h2>
+    <a class="btn primary" href="/model?new=1" style="margin-left:auto">＋ 新增配置</a>
+  </div>
+  <div class="hint" style="margin-bottom:12px">「激活」设为当前生效 ·「编辑」修改参数 ·「删除」移除（当前激活项不可删，名称不可重复）</div>
+  <table>
+    <thead><tr><th>名称</th><th>模型</th><th>Base URL</th><th>状态</th><th>操作</th></tr></thead>
+    <tbody>{body}</tbody>
+  </table>
+  <div class="sub" style="margin-top:10px">当前生效：{esc(B.effective_model_desc())}</div>
+</div>
+"""
+
+
+def provider_form(mode: str, name: str = "") -> str:
+    """新增 / 编辑表单。mode: new | edit；点「新增」或「编辑」时才显示。"""
+    is_edit = (mode == "edit")
+    e = B.get_provider(name) if is_edit else None
+    if is_edit and not e:
+        return ('<div class="card"><div class="hint">配置「' + esc(name)
+                + '」不存在，无法编辑。</div><a class="btn" href="/model">返回列表</a></div>')
+    e = e or {}
     levels = ("", "off", "minimal", "low", "medium", "high", "xhigh", "max")
-    backends = (("auto", "auto（填了 Base URL 就直连，否则用 pi）"),
-                ("http", "http：直连模型服务（推荐）"),
-                ("pi", "pi：调用本机 pi CLI"))
-    protos = (("", "自动识别（推荐）"),
-              ("openai", "openai 兼容（/v1/chat/completions）"),
+    protos = (("openai", "openai 兼容（推荐）"),
               ("anthropic", "anthropic（/v1/messages）"),
               ("ollama", "ollama 本地（/api/chat）"))
-    cur_think = st["thinking"] if st["backend"] == "http" else (cfg.get("pi_thinking") or "")
-    cur_model = st["model"] if st["backend"] == "http" else (cfg.get("pi_model") or "")
-    key_state = (f"已保存 {st['key_masked']}（留空 = 不改动）" if st["has_key"]
-                 else ("本地 ollama 可留空" if st["protocol"] == "ollama" else "尚未设置（必填）"))
+    action = "update_provider" if is_edit else "create_provider"
+    title = "编辑模型配置" if is_edit else "新增模型配置"
+    if is_edit and e.get("api_key"):
+        key_ph = "sk-...（留空 = 保持原 key 不变）"
+    elif e.get("protocol") == "ollama":
+        key_ph = "sk-...（本地 ollama 可留空）"
+    else:
+        key_ph = "sk-...（必填，除非本地 ollama）"
 
     def opts(pairs, cur):
         return "".join(f'<option value="{esc(v)}"'
                        f'{" selected" if v == cur else ""}>{esc(lbl)}</option>'
                        for v, lbl in pairs)
 
-    # ---- 命名配置：随时切换，不用再填 ----
-    provs = st.get("providers") or []          # [(name, desc), ...]
-    active = st.get("active_provider") or ""
-    url_host = (cfg.get("llm_base_url") or "").split("://")[-1].split("/")[0].split(":")[0]
-    suggested = re.sub(r"[^A-Za-z0-9_.\-]", "", url_host)[:40] or "default"
-    if provs:
-        rows = []
-        for name, desc in provs:
-            mark = ' <span class="state ok">● 当前</span>' if name == active else ""
-            rows.append(f"""
-    <div class="row" style="align-items:center;margin:6px 0">
-      <div style="flex:2;min-width:200px"><b>{esc(name)}</b>{mark}
-        <div class="sub mono">{esc(desc)}</div></div>
-      <form method="post" action="/action" style="margin:0">
-        <input type="hidden" name="csrf" value="{CSI}">
-        <input type="hidden" name="action" value="switch_provider">
-        <input type="hidden" name="profile_name" value="{esc(name)}">
-        <button class="btn" type="submit">切换</button>
-      </form>
-      <form method="post" action="/action" style="margin:0"
-            onsubmit="return confirm('删除配置 {esc(name)}？（不影响当前生效值）')">
-        <input type="hidden" name="csrf" value="{CSI}">
-        <input type="hidden" name="action" value="delete_provider">
-        <input type="hidden" name="profile_name" value="{esc(name)}">
-        <button class="btn danger" type="submit">删除</button>
-      </form>
-    </div>""")
-        prov_list = "".join(rows)
-        prov_empty = ""
-    else:
-        prov_list = ""
-        prov_empty = ('<div class="hint" style="margin:6px 0">还没有保存的命名配置。'
-                     '填好下面的 Base URL / Key / 模型后，点「存为命名配置」就能随时切回来，不用再输。</div>')
-    profiles_block = f"""
-  <div class="card" style="background:#f4f6fb;margin-bottom:14px">
-    <h3 style="margin:2px 0 6px">↺ 已保存的命名配置（随时切换，不用再填）</h3>
-    {prov_list}
-    {prov_empty}
-    <form method="post" action="/action" class="row" style="align-items:flex-end;margin-top:8px">
-      <input type="hidden" name="csrf" value="{CSI}">
-      <input type="hidden" name="action" value="save_provider">
-      <div style="flex:2;min-width:220px"><label>把当前配置存为命名配置</label>
-        <input type="text" name="profile_name" value="{esc(suggested)}"
-               placeholder="起个名字，如 deepseek / local-165 / gpt"></div>
-      <button class="btn primary" type="submit">存为命名配置</button>
-    </form>
-  </div>
-"""
-
     return f"""
-<div class="card">
-  <h2>模型接入（三步就能跑）</h2>
-  <div class="hint">给 <b>Base URL + API Key + 模型名</b> 就能审核，不依赖本机装了什么 CLI。
-    支持 DeepSeek / OpenAI / Moonshot / 智谱 / OpenRouter / vLLM·LiteLLM·OneAPI 自建网关 / 本机 Ollama。</div>
-
-  {profiles_block}
-
-  <form method="post" action="/action" id="provform">
+<div class="card" style="border:1px solid #5b8cff">
+  <h2>{title}</h2>
+  <form method="post" action="/action">
     <input type="hidden" name="csrf" value="{CSI}">
-    <input type="hidden" name="action" value="provider">
-    <input type="hidden" name="from" value="{esc(src)}">
-
-    <div class="step"><span class="stepno">1</span><b>模型服务地址</b></div>
+    <input type="hidden" name="action" value="{action}">
+    {'<input type="hidden" name="old_name" value="' + esc(name) + '">' if is_edit else ""}
+    <div class="row" style="align-items:flex-end">
+      <div style="width:300px"><label>名称*</label>
+        <input type="text" name="name" value="{esc(name if is_edit else "")}"
+               placeholder="如 deepseek / local-165 / gpt" required></div>
+      <span class="hint">名称不能与已有配置重复</span>
+    </div>
     <div class="row">
-      <div style="width:260px"><label>后端</label>
-        <select name="backend">{opts(backends, st["backend"])}</select></div>
-      <div style="flex:2;min-width:300px"><label>Base URL（会自动补 /v1，粘完整接口路径也能识别）</label>
-        <input type="text" name="base_url" value="{esc(cfg.get('llm_base_url') or '')}"
+      <div style="flex:2;min-width:280px"><label>Base URL</label>
+        <input type="text" name="base_url" value="{esc(e.get('base_url') or '')}"
                placeholder="https://api.deepseek.com 或 http://127.0.0.1:11434"></div>
       <div style="width:280px"><label>协议</label>
-        <select name="protocol">{opts(protos, cfg.get("llm_protocol") or "")}</select></div>
+        <select name="protocol">{opts(protos, e.get('protocol') or 'openai')}</select></div>
     </div>
-
-    <div class="step"><span class="stepno">2</span><b>API Key</b>
-      <span class="sub">（{esc(key_state)}；当前协议：{esc(st['protocol'])}）</span></div>
     <div class="row">
-      <div style="flex:2;min-width:300px"><label>API Key</label>
+      <div style="flex:2;min-width:280px"><label>API Key</label>
         <input type="password" name="api_key" value="" autocomplete="new-password"
-               placeholder="sk-... （留空表示保持已保存的密钥不变）"></div>
-      <div style="width:170px"><label>清空已保存的 Key</label>
-        <select name="clear_key"><option value="">否</option><option value="1">是，清空</option></select></div>
+               placeholder="{esc(key_ph)}"></div>
     </div>
-    <div class="hint">密钥只写进 <code>config.json</code>（已在 <code>.gitignore</code> 里，不会进仓库）；
-      不想落盘可用环境变量 <code>CODE_REVIEW_BOT_API_KEY</code>。页面和日志里只会看到掩码。</div>
-
-    <div class="step"><span class="stepno">3</span><b>选模型</b>
-      <span class="sub">（不确定有哪些？先点下面的「获取模型列表」，再从下拉里选）</span></div>
     <div class="row">
-      <div style="flex:2;min-width:260px"><label>模型名（手填）</label>
-        <input type="text" id="model" name="model" value="{esc(cur_model)}"
-               placeholder="deepseek-chat / gpt-4o-mini / qwen2.5-coder:7b …"></div>
-      <div style="flex:2;min-width:260px;display:none" id="pickbox"><label>从服务拉到的模型（选它会自动填到上面）</label>
-        <select id="modelpick"></select></div>
-      <div style="width:150px"><label>思考强度</label>
-        <select name="thinking">{opts([(l, l or "默认") for l in levels], cur_think)}</select></div>
-      <div style="flex:1;min-width:180px"><label>备用模型（上游繁忙自动切）</label>
-        <input type="text" name="fallback" value="{esc(st['fallback_model'])}" placeholder="可留空"></div>
+      <div style="flex:2;min-width:240px"><label>模型名</label>
+        <input type="text" name="model" value="{esc(e.get('model') or '')}"
+               placeholder="deepseek-chat / gpt-4o-mini / qwen2.5-coder:7b"></div>
+      <div style="width:180px"><label>思考强度</label>
+        <select name="thinking">{opts([(l, l or "默认") for l in levels], e.get('thinking') or '')}</select></div>
     </div>
-
-    <details class="adv"><summary>高级参数（一般不用改）</summary>
-      <div class="row" style="margin-top:10px">
-        <div style="width:170px"><label>单次输出上限 tokens</label>
-          <input type="number" name="max_output_tokens" min="512" max="200000"
-                 value="{esc(cfg.get('llm_max_output_tokens') or 8000)}"></div>
-        <div style="width:170px"><label>分批文件数</label>
-          <input type="number" name="review_chunk_files" min="0" max="500"
-                 value="{esc(cfg.get('review_chunk_files'))}"></div>
-        <div style="width:190px"><label>分批字符上限</label>
-          <input type="number" name="max_chars_per_chunk" min="10000" max="2000000"
-                 value="{esc(cfg.get('max_chars_per_chunk') or 120000)}"></div>
-      </div>
-    </details>
-
-    <div class="row" style="margin-top:14px">
-      <button class="btn primary" type="submit">保存</button>
-      <button class="btn" type="button"
-              onclick="provRun('/api/provider/models', this)">① 获取模型列表</button>
-      <button class="btn" type="button"
-              onclick="provRun('/api/provider/test', this)">② 测试连通性</button>
-      <span class="hint">这两个按钮不用先保存，直接用你当前填的值</span>
+    <div class="row">
+      <div style="width:190px"><label>单次输出上限 tokens</label>
+        <input type="number" name="max_output_tokens" min="512" max="200000"
+               value="{esc(e.get('max_output_tokens') or 8000)}"></div>
+      <div style="width:150px"><label>温度</label>
+        <input type="number" name="temperature" step="0.05" min="0" max="2"
+               value="{esc(e.get('temperature') or 0.2)}"></div>
+      <div style="flex:2;min-width:180px"><label>备用模型（上游繁忙自动切）</label>
+        <input type="text" name="fallback" value="{esc(B.CONFIG.get('fallback_model') or '')}"
+               placeholder="可留空"></div>
+    </div>
+    <div class="row" style="margin-top:16px">
+      <button class="btn primary" type="submit" name="activate" value="1">保存并激活</button>
+      <button class="btn" type="submit">仅保存</button>
+      <a class="btn" href="/model">取消</a>
     </div>
   </form>
-  <div class="out" id="provout"></div>
-  <div class="sub" style="margin-top:10px">当前生效：{esc(B.effective_model_desc())}</div>
-  <div class="hint">命令行等价：<code>python bot.py model --base-url … --api-key … --set …</code>
-    · <code>python bot.py model --list</code> · <code>python bot.py model --test</code></div>
+  <div class="hint">命令行等价：<code>python bot.py provider --list</code> ·
+    <code>python bot.py provider --use NAME</code> · <code>python bot.py provider --save NAME</code></div>
 </div>
 """
 
 
-def page_model(flash: str = "", err: bool = False) -> str:
-    """模型配置独立页面：不自动刷新，慢慢填不会被冲掉"""
-    st = B.provider_status()
-    cur = f"""
-<div class="card">
-  <h2>当前生效</h2>
-  <div class="kv">
-    <div class="k">后端</div><div>{esc(st['backend'])}
-      {'（未填 Base URL 时自动用 pi CLI）' if st['backend'] == 'pi' else ''}</div>
-    <div class="k">协议</div><div>{esc(st['protocol'])}</div>
-    <div class="k">Base URL</div><div>{esc(st['base_url'] or '（未配置）')}</div>
-    <div class="k">API Key</div><div>{esc(st['key_masked'] or '（未设置）')}</div>
-    <div class="k">模型</div><div>{esc(st['model'] or st['pi_model'] or '（未指定）')}</div>
-    <div class="k">思考强度</div><div>{esc(st['thinking'] or st['pi_thinking'] or '默认')}</div>
-    <div class="k">备用模型</div><div>{esc(st['fallback_model'] or '（不启用）')}</div>
-    <div class="k">单次输出上限</div><div>{esc(st['max_output_tokens'])} tokens</div>
-  </div>
-  <div class="hint" style="margin-top:10px">本页<b>不会自动刷新</b>；控制台首页的自动刷新在你
-    正在输入时也会自动暂停。</div>
-</div>
-"""
-    return layout("模型配置", card_provider("/model") + cur, refresh=0,
-                    flash=flash, flash_err=err)
-
+def page_model(flash: str = "", err: bool = False, mode: str = "list", name: str = "") -> str:
+    """模型配置页：默认显示列表；?new=1 或 ?edit=NAME 时展开表单。不自动刷新。"""
+    form = provider_form(mode, name) if mode in ("new", "edit") else ""
+    return layout("模型配置", provider_list() + form, refresh=0,
+                  flash=flash, flash_err=err)
 
 
 def page_dashboard(flash: str = "", err: bool = False) -> str:
@@ -975,29 +941,54 @@ def do_action(form: dict) -> tuple:
         reload_config()
         return ("审批 / 确认信设置已保存", False, "/")
 
-    if a == "switch_provider":
-        name = (form.get("profile_name") or [""])[0]
+    def _prov_entry():
+        g = lambda k: (form.get(k) or [""])[0]
+        return {"base_url": g("base_url"), "protocol": g("protocol") or "openai",
+                "api_key": g("api_key"), "model": g("model"), "thinking": g("thinking"),
+                "max_output_tokens": g("max_output_tokens") or "8000",
+                "temperature": g("temperature") or "0.2"}
+
+    def _save_fb():
+        fb = (form.get("fallback") or [None])[0]
+        if fb is not None:
+            B.CONFIG["fallback_model"] = (fb or "").strip()
+
+    if a in ("activate_provider", "switch_provider"):
+        name = (form.get("name") or form.get("profile_name") or [""])[0]
         err = B.switch_provider(name)
         if err:
-            return (f"切换失败：{err}", True, "/")
+            return (f"激活失败：{err}", True, "/model")
         B.reload_config(); reload_config()
-        return (f"已切换到「{name}」：{B.effective_model_desc()}", False, "/")
+        return (f"✅ 已激活「{name}」：{B.effective_model_desc()}", False, "/model")
 
-    if a == "save_provider":
-        name = (form.get("profile_name") or [""])[0]
-        err = B.save_provider(name)
+    if a in ("create_provider", "save_provider"):
+        name = (form.get("name") or form.get("profile_name") or [""])[0]
+        act = (form.get("activate") or [""])[0] == "1"
+        err = B.create_provider(name, _prov_entry(), activate=act)
         if err:
-            return (f"保存命名配置失败：{err}", True, "/")
+            return (f"新增失败：{err}", True, "/model")
+        _save_fb(); B._save_config()
         B.reload_config(); reload_config()
-        return (f"已把当前配置存为「{name}」（现在是当前生效配置）", False, "/")
+        return (f"✅ 已新增「{name}」" + ("（已激活）" if act else ""), False, "/model")
+
+    if a == "update_provider":
+        old = (form.get("old_name") or [""])[0]
+        name = (form.get("name") or [""])[0]
+        act = (form.get("activate") or [""])[0] == "1"
+        err = B.update_provider(old, name, _prov_entry(), activate=act)
+        if err:
+            return (f"保存失败：{err}", True, "/model")
+        _save_fb(); B._save_config()
+        B.reload_config(); reload_config()
+        return (f"✅ 已保存「{name}」" + ("（已激活）" if act else ""), False, "/model")
 
     if a == "delete_provider":
-        name = (form.get("profile_name") or [""])[0]
+        name = (form.get("name") or form.get("profile_name") or [""])[0]
         err = B.delete_provider(name)
         if err:
-            return (f"删除失败：{err}", True, "/")
+            return (f"删除失败：{err}", True, "/model")
         B.reload_config(); reload_config()
-        return (f"已删除命名配置「{name}」（当前生效值不受影响）", False, "/")
+        return (f"已删除「{name}」（当前生效值不受影响）", False, "/model")
 
     if a in ("provider", "model"):
         err = B.apply_provider(form_flat(form))
@@ -1068,7 +1059,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, page_dashboard(flash, err))
             if path in ("/model", "/model.html"):
                 flash, err = self._flash_from_query(qs)
-                return self._send(200, page_model(flash, err))
+                if qs.get("new"):
+                    mode, name = "new", ""
+                elif qs.get("edit"):
+                    mode, name = "edit", qs["edit"][0]
+                else:
+                    mode, name = "list", ""
+                return self._send(200, page_model(flash, err, mode=mode, name=name))
             if path == "/api/status":
                 return self._send(200, json.dumps({
                     "daemon_alive": daemon_alive(),

@@ -60,6 +60,14 @@ def post(path, form, headers=None):
     return r.status, dict(r.getheaders()), body
 
 
+def flash_of(hdr):
+    """从重定向 Location 里解出 flash 文案（URL 解码）"""
+    loc = hdr.get("Location") or ""
+    q = urllib.parse.urlparse(loc).query
+    kv = urllib.parse.parse_qs(q)
+    return kv.get("m", [""])[0]
+
+
 def main():
     # --- 造一个带 XSS payload 的任务 + 报告 ---
     xss_mid = "msg_UItestXSS"
@@ -187,14 +195,14 @@ def main():
               B.CONFIG.get("review_requirements"))
         post("/action", {"action": "global_req", "csrf": ui.CSI, "value": ""})
 
-        # 7.5 模型接入（卡片在 /model 页 / 列表 / 测试 / 保存）
+        # 7.5 模型接入（列表 + 新增/编辑表单在 /model）
         try:
-            st, _, body = get("/model")
-            check("/model 页有模型接入卡片", 'name="base_url"' in body and "获取模型列表" in body,
-                  body[:120])
-            check("卡片不暴露已保存的密钥原文",
+            st, _, body = get("/model?new=1")
+            check("新增表单有 Base URL / API Key / 模型字段",
+                  'name="base_url"' in body and 'name="api_key"' in body
+                  and 'name="model"' in body and 'name="name"' in body, body[:120])
+            check("表单不暴露已保存的密钥原文",
                   (B.CONFIG.get("llm_api_key") or "zz") not in body)
-            check("卡片带测试连通性按钮", "测试连通性" in body)
 
             st, _, _ = post("/api/provider/models", {"base_url": "http://127.0.0.1:1"})
             check("provider API 无 CSRF 被拒", st == 403, st)
@@ -262,10 +270,12 @@ def main():
             # 模型配置页 / 自动刷新不再冲掉输入
             st, hdr, body = get("/model")
             check("模型配置页可达", st == 200, st)
-            check("模型配置页分步引导", "三步就能跑" in body and "API Key" in body, body[:120])
-            check("API Key 用密码框且明确留空语义",
-                  'type="password" name="api_key"' in body and "留空表示保持已保存的密钥不变" in body,
-                  body[:200])
+            check("模型配置页是列表(含名称/状态/操作)",
+                  "模型配置" in body and "新增配置" in body and "状态" in body and "操作" in body,
+                  body[:120])
+            st, _, body = get("/model?new=1")
+            check("API Key 用密码框", 'type="password" name="api_key"' in body, body[:200])
+            st, _, body = get("/model")
             check("模型配置页不自动刷新", "REFRESH_SEC = 0" in body, body[-250:])
             check("任何页面都不再用 meta refresh 打断输入",
                   "http-equiv=\"refresh\"" not in body)
@@ -276,38 +286,62 @@ def main():
             check("控制台改用模型入口(不再放完整配置卡片)",
                   'href="/model"' in body and 'id="provform"' not in body)
 
-            # 命名配置：保存 / 切换 / 删除（全走真实动作，但用假 key、不联网）
-            post("/action", {"action": "provider", "csrf": ui.CSI,
-                             "base_url": "https://api.alpha.example",
-                             "api_key": "sk-FAKE-ALPHA-0001", "model": "alpha-model"})
-            st, hdr, _ = post("/action", {"action": "save_provider", "csrf": ui.CSI,
-                                          "profile_name": "alpha"})
-            check("保存命名配置 alpha 成功", st == 303, st)
-            check("alpha 进入 providers", "alpha" in (B.CONFIG.get("providers") or {}))
-            post("/action", {"action": "provider", "csrf": ui.CSI,
-                             "base_url": "https://api.beta.example",
-                             "api_key": "sk-FAKE-BETA-0002", "model": "beta-model"})
-            post("/action", {"action": "save_provider", "csrf": ui.CSI, "profile_name": "beta"})
-            st, hdr, _ = post("/action", {"action": "switch_provider", "csrf": ui.CSI,
-                                          "profile_name": "alpha"})
-            check("切换到 alpha", st == 303, st)
-            check("切换后生效模型是 alpha-model", B.CONFIG.get("llm_model") == "alpha-model",
-                  B.CONFIG.get("llm_model"))
-            check("active_provider = alpha", B.get_active_provider() == "alpha")
+            # 模型配置：列表 + 新增/编辑/激活/删除（假 key、不联网）
             st, _, body = get("/model")
-            check("/model 页展示已保存的命名配置", "已保存的命名配置" in body and "alpha" in body
-                  and "beta" in body, body[:200])
-            check("/model 页有「存为命名配置」按钮", "存为命名配置" in body)
-            # 非法/不存在
-            st, hdr, _ = post("/action", {"action": "switch_provider", "csrf": ui.CSI,
-                                          "profile_name": "ghost"})
-            check("切换不存在的命名配置被拒", st == 303 and (hdr.get("Location") or "").startswith("/?m="), str(hdr))
-            st, hdr, _ = post("/action", {"action": "delete_provider", "csrf": ui.CSI,
-                                          "profile_name": "alpha"})
-            check("删除命名配置 alpha", st == 303 and "alpha" not in (B.CONFIG.get("providers") or {}), str(hdr))
-            # 收尾：把当前配置存为一个默认命名，避免影响用户真实配置
+            check("列表页有「模型配置」和「新增配置」", "模型配置" in body and "新增配置" in body,
+                  body[:120])
+            st, _, body = get("/model?new=1")
+            check("新增表单出现且是 create_provider", "新增模型配置" in body
+                  and 'value="create_provider"' in body and 'name="name"' in body, body[:150])
+            # 新增 alpha（激活）
+            st, hdr, _ = post("/action", {"action": "create_provider", "csrf": ui.CSI,
+                                          "name": "alpha", "base_url": "https://api.alpha.example",
+                                          "api_key": "sk-FAKE-ALPHA-0001", "model": "alpha-model",
+                                          "activate": "1"})
+            check("新增 alpha 成功", st == 303, st)
+            check("alpha 进入 providers", "alpha" in (B.CONFIG.get("providers") or {}))
+            check("新增后生效模型 alpha-model", B.CONFIG.get("llm_model") == "alpha-model",
+                  B.CONFIG.get("llm_model"))
+            # 新增重名被拦
+            st, hdr, _ = post("/action", {"action": "create_provider", "csrf": ui.CSI,
+                                          "name": "alpha", "base_url": "x", "model": "y"})
+            check("新增重名被拒(名称不能重复)", "已存在" in flash_of(hdr),
+                  flash_of(hdr))
+            # 编辑 alpha 表单预填
+            st, _, body = get("/model?edit=alpha")
+            check("编辑表单预填 alpha", "编辑模型配置" in body
+                  and 'value="update_provider"' in body and 'old_name" value="alpha"' in body,
+                  body[:150])
+            # 激活项不可删：alpha 现在是激活的
+            st, hdr, _ = post("/action", {"action": "delete_provider", "csrf": ui.CSI, "name": "alpha"})
+            check("删除激活项被拒(激活不可删)", "不能删除" in flash_of(hdr),
+                  flash_of(hdr))
+            # 列表页：激活行不带「删除」按钮
+            st, _, body = get("/model")
+            check("列表页存在激活标记", "当前生效" in body, body[:120])
+            # 新增 beta 再激活它，让 alpha 可删
+            post("/action", {"action": "create_provider", "csrf": ui.CSI,
+                             "name": "beta", "base_url": "https://api.beta.example",
+                             "api_key": "sk-FAKE-BETA-0002", "model": "beta-model", "activate": "1"})
+            st, hdr, _ = post("/action", {"action": "delete_provider", "csrf": ui.CSI, "name": "alpha"})
+            check("删除非激活 alpha 成功",
+                  "已删除" in flash_of(hdr) and
+                  "alpha" not in (B.CONFIG.get("providers") or {}), flash_of(hdr))
+            # 编辑改名撞已有名被拦（把 beta 改名为 beta 之外的已存在名）
+            post("/action", {"action": "create_provider", "csrf": ui.CSI,
+                             "name": "gamma", "base_url": "g", "model": "gm"})
+            st, hdr, _ = post("/action", {"action": "update_provider", "csrf": ui.CSI,
+                                          "old_name": "beta", "name": "gamma",
+                                          "base_url": "x", "model": "y"})
+            check("编辑改名撞已有名被拒(名称不能重复)", "已被占用" in flash_of(hdr),
+                  flash_of(hdr))
+            # 收尾：清理测试配置，恢复一个默认命名
+            B.delete_provider("gamma")
+            B.delete_provider("beta")
             B.CONFIG["llm_model"] = "deepseek-chat"
-            B.save_provider("default")
+            B.create_provider("default", {"base_url": "https://api.deepseek.com",
+                                          "api_key": "", "model": "deepseek-chat"},
+                              activate=True)
             B.switch_provider("default")
 
             st, hdr, _ = post("/action", {"action": "provider", "csrf": ui.CSI,

@@ -2011,64 +2011,148 @@ def _top_from_entry(v: dict) -> dict:
     return m
 
 
-def save_provider(name: str, save: bool = True) -> str:
-    """把当前顶层 llm_* 存为命名配置（可选设为 active）"""
+def get_provider(name: str):
+    """返回命名配置的 entry(dict)；不存在返回 None"""
+    provs = CONFIG.get("providers") or {}
+    v = provs.get((name or "").strip())
+    return v if isinstance(v, dict) else None
+
+
+def _normalize_entry(entry: dict) -> dict:
+    """把表单传来的 entry 归一化成存盘结构"""
+    entry = entry or {}
+    out = {
+        "base_url": (entry.get("base_url") or "").strip(),
+        "protocol": (entry.get("protocol") or "openai").strip() or "openai",
+        "api_key": entry.get("api_key") or "",
+        "model": (entry.get("model") or "").strip(),
+        "thinking": (entry.get("thinking") or "").strip(),
+    }
+    try:
+        out["max_output_tokens"] = int(entry.get("max_output_tokens") or 8000)
+    except (TypeError, ValueError):
+        out["max_output_tokens"] = 8000
+    try:
+        out["temperature"] = float(entry.get("temperature", 0.2))
+    except (TypeError, ValueError):
+        out["temperature"] = 0.2
+    return out
+
+
+def _check_name(name: str) -> str:
     name = (name or "").strip()
     if not name:
-        return "配置名不能为空"
+        return "名称不能为空"
     if not PROVIDER_NAME_RE.match(name):
-        return "配置名只能由字母/数字开头，后续可含 _ . -，长度 ≤ 64"
-    if not (CONFIG.get("llm_base_url") or CONFIG.get("llm_model")):
-        return "当前还没有可保存的模型配置（先填 Base URL / 模型）"
-    entry = _snapshot_to_top()
+        return "名称不合法（字母/数字开头，后续可含 _ . -，长度 ≤ 64）"
+    return ""
+
+
+def _apply_to_top(name: str) -> None:
+    """把指定命名配置展开到顶层 llm_*（= 设为当前生效）"""
     provs = CONFIG.get("providers") or {}
-    provs[name] = entry
-    CONFIG["providers"] = provs
+    if name not in provs:
+        return
+    CONFIG.update(_top_from_entry(provs[name]))
     CONFIG["active_provider"] = name
+
+
+def create_provider(name: str, entry: dict, activate: bool = False, save: bool = True) -> str:
+    """新增命名配置。名称不可重复。"""
+    name = (name or "").strip()
+    err = _check_name(name)
+    if err:
+        return err
+    provs = CONFIG.get("providers") or {}
+    if name in provs:
+        return f"名称「{name}」已存在（名称不能重复）"
+    e = _normalize_entry(entry)
+    if not (e["base_url"] or e["model"]):
+        return "至少要填 Base URL 或 模型名"
+    provs[name] = e
+    CONFIG["providers"] = provs
+    if activate:
+        _apply_to_top(name)
+    if save:
+        _save_config()
+    return ""
+
+
+def update_provider(old_name: str, new_name: str, entry: dict,
+                    activate: bool = False, save: bool = True) -> str:
+    """编辑命名配置（可改名称）。新名称不可与其他已有配置重复。"""
+    old_name = (old_name or "").strip()
+    new_name = (new_name or "").strip()
+    provs = CONFIG.get("providers") or {}
+    if old_name not in provs:
+        return f"配置「{old_name}」不存在"
+    err = _check_name(new_name)
+    if err:
+        return err
+    if new_name != old_name and new_name in provs:
+        return f"名称「{new_name}」已被占用（名称不能重复）"
+    # api_key 空串 = 保持原 key（避免编辑其他字段时把密钥擦掉）
+    e = _normalize_entry(entry)
+    if not e.get("api_key") and provs[old_name].get("api_key"):
+        e["api_key"] = provs[old_name]["api_key"]
+    if not (e["base_url"] or e["model"]):
+        return "至少要填 Base URL 或 模型名"
+    provs[new_name] = e
+    if new_name != old_name:
+        del provs[old_name]
+        if (CONFIG.get("active_provider") or "") == old_name:
+            CONFIG["active_provider"] = new_name  # 激活跟随重命名
+    CONFIG["providers"] = provs
+    if activate:
+        _apply_to_top(new_name)
     if save:
         _save_config()
     return ""
 
 
 def switch_provider(name: str, save: bool = True) -> str:
-    """切换到命名配置（把 entry 展开到顶层）"""
+    """激活：把命名配置展开到顶层（设为当前生效）"""
     name = (name or "").strip()
     provs = CONFIG.get("providers") or {}
     if name not in provs:
         avail = ", ".join(sorted(provs)) or "（无）"
-        return f"配置 {name!r} 不存在。现有：{avail}"
-    CONFIG.update(_top_from_entry(provs[name]))
-    CONFIG["active_provider"] = name
+        return f"配置「{name}」不存在。现有：{avail}"
+    _apply_to_top(name)
     if save:
         _save_config()
     return ""
 
 
 def delete_provider(name: str, save: bool = True) -> str:
+    """删除命名配置；当前激活的配置不可删"""
     name = (name or "").strip()
     provs = CONFIG.get("providers") or {}
     if name not in provs:
-        return f"配置 {name!r} 不存在"
+        return f"配置「{name}」不存在"
+    if (CONFIG.get("active_provider") or "") == name:
+        return "当前激活的配置不能删除——请先「激活」另一个配置，再来删除"
     del provs[name]
     CONFIG["providers"] = provs
-    if (CONFIG.get("active_provider") or "") == name:
-        CONFIG["active_provider"] = ""
     if save:
         _save_config()
     return ""
 
 
 def migrate_legacy_provider(save: bool = True) -> str:
-    """首次升级：如果顶层有 llm_* 但 providers 还是空的，自动存为 “default”。"""
+    """首次升级：顶层有 llm_* 但 providers 为空时，自动存为 default。"""
     provs = CONFIG.get("providers") or {}
     if provs:
         return ""
     if not (CONFIG.get("llm_base_url") or CONFIG.get("llm_model")):
         return ""
-    err = save_provider("default", save=save)
+    err = create_provider("default", _snapshot_to_top(), activate=True, save=save)
     if not err and save:
         log("已把现有顶层模型配置存为命名配置 default")
     return err
+
+
+# 兼容旧调用（UI/测试里可能用过）
+save_provider = create_provider
 
 
 # ---------------------------------------------------------------- provider 应用（表单字段 -> 顶层）
