@@ -123,6 +123,16 @@ def main():
         check("详情页要求区块已转义",
               "&lt;script&gt;" in body or "<script>alert(3)" not in body, "")
 
+        # 详情页的「重跑/立即处理」按钮必须带上任务 id（否则提交空 id -> 空 /task/ 页）
+        import re as _re
+        retry_forms = _re.findall(r'<form[^>]*action="/action"[^>]*>.*?</form>', body, _re.S)
+        retry_ok = any('value="retry"' in f and f'name="id" value="{xss_mid}"' in f
+                       for f in retry_forms)
+        check("详情页重跑按钮带上任务 id", retry_ok, "")
+        process_ok = any('value="process"' in f and f'name="id" value="{xss_mid}"' in f
+                         for f in retry_forms)
+        check("详情页立即处理按钮带上任务 id", process_ok, "")
+
         st, hdr, body = get(f"/report/{xss_mid}?f=" + urllib.parse.quote("代码审核报告.md"))
         check("报告预览 200", st == 200, st)
         check("报告预览不执行 md 里的 <script>", "<script>alert" not in body, "报告 XSS 未转义")

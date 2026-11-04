@@ -698,9 +698,9 @@ def page_task(mid: str, flash: str = "", err: bool = False) -> str:
     <div class="k">message_id</div><div class="mono">{esc(mid)}</div>
   </div>
   <div class="row" style="margin-top:14px">
-    {form_btn("retry", "重跑（会重新审核并发送回复）", "primary",
-              "重跑会重新审核并可能再次发送回复邮件，确定？")}
-    {form_btn("process", "立即处理（后台）", "", "")}
+    {form_btn("retry", "重跑（会重新审核并发送回复）", "primary", mid=mid,
+              confirm="重跑会重新审核并可能再次发送回复邮件，确定？")}
+    {form_btn("process", "立即处理（后台）", "", "", mid=mid)}
     <a class="btn" href="/">返回</a>
   </div>
 </div>
@@ -850,6 +850,9 @@ def do_action(form: dict) -> tuple:
     """返回 (flash_message, is_error, redirect)"""
     a = (form.get("action") or [""])[0]
     mid = (form.get("id") or [""])[0]
+    # 需要任务 id 的动作：id 为空就直接报错，别重定向到空 /task/ 页面
+    if a in ("retry", "process", "task_req", "approve", "reject", "reject_reason") and not mid:
+        return ("操作缺少任务 ID（按钮未带上任务，请刷新后重试）", True, "/")
 
     if a in ("start", "stop", "restart", "scan"):
         rc, out = run_bot_cli(a, timeout=180)
