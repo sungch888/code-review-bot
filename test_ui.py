@@ -240,6 +240,31 @@ def main():
                              "model": "deepseek-chat"})
             check("clear_key 显式清空密钥", B.CONFIG.get("llm_api_key") == "",
                   B.CONFIG.get("llm_api_key"))
+            # 模型配置页 / 自动刷新不再冲掉输入
+            st, hdr, body = get("/model")
+            check("模型配置页可达", st == 200, st)
+            check("模型配置页分步引导", "三步就能跑" in body and "API Key" in body, body[:120])
+            check("API Key 用密码框且明确留空语义",
+                  'type="password" name="api_key"' in body and "留空表示保持已保存的密钥不变" in body,
+                  body[:200])
+            check("模型配置页不自动刷新", "REFRESH_SEC = 0" in body, body[-250:])
+            check("任何页面都不再用 meta refresh 打断输入",
+                  "http-equiv=\"refresh\"" not in body)
+            st, _, body = get("/")
+            check("控制台改用可暂停的 JS 刷新", "REFRESH_SEC = 20" in body and "formBusy" in body,
+                  body[-250:])
+            check("控制台会提示「正在输入，自动刷新已暂停」", "自动刷新已暂停" in body)
+            check("控制台也有模型接入卡片", 'id="provform"' in body)
+
+            st, hdr, _ = post("/action", {"action": "provider", "csrf": ui.CSI,
+                                          "from": "/model", "model": "deepseek-chat"})
+            check("从 /model 保存后留在 /model",
+                  (hdr.get("Location") or "").startswith("/model"), hdr.get("Location"))
+            st, hdr, _ = post("/action", {"action": "provider", "csrf": ui.CSI,
+                                          "from": "http://evil.example/x", "model": "deepseek-chat"})
+            check("from 字段不接受外部跳转", (hdr.get("Location") or "").startswith("/?"),
+                  hdr.get("Location"))
+
             # 守护进程无需重启就能读到新配置
             B.CONFIG["review_requirements"] = "SENTINEL"
             B._save_config()

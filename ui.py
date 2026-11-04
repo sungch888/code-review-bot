@@ -136,6 +136,12 @@ input[type=password],input[type=number]{background:#12151b;border:1px solid var(
 .out.bad{border-left-color:#ff453a;color:#ff9d9d}
 .out.ok{border-left-color:#30d158;color:#8ff0b1}
 .hint{color:var(--dim);font-size:12px;line-height:1.6}
+.step{margin:16px 0 8px;font-size:13.5px;color:var(--fg);display:flex;align-items:center;gap:8px}
+.stepno{display:inline-flex;width:20px;height:20px;border-radius:50%;background:#1f4fa8;
+ color:#fff;align-items:center;justify-content:center;font-size:12px}
+.adv{margin-top:12px;border:1px dashed var(--line);border-radius:8px;padding:8px 12px}
+.adv summary{cursor:pointer;color:var(--dim);font-size:12.5px}
+input[type=password]{font-family:Consolas,monospace}
 .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 input[type=text],textarea,select{background:#12151b;border:1px solid var(--line);color:var(--fg);
  border-radius:7px;padding:7px 9px;font:13px/1.5 inherit;width:100%}
@@ -196,6 +202,7 @@ async function provRun(url, btn){
         if (m === cur) o.selected = true;
         sel.appendChild(o);
       });
+      var box = document.getElementById('pickbox'); if (box) box.style.display = 'block';
       sel.style.display = 'block';
       provOut(j.message || ('共 ' + j.models.length + ' 个模型，选一个再点保存'));
     } else {
@@ -215,8 +222,44 @@ def esc(s) -> str:
     return html.escape("" if s is None else str(s), quote=True)
 
 
+# 自动刷新：只要页面上有表单正在输入/被修改，就暂停刷新（否则会把输到一半的内容冲掉）
+REFRESH_JS = """
+var INIT_VALUES = new Map();
+function rememberInit(){
+  document.querySelectorAll('form input, form textarea, form select').forEach(function(el){
+    INIT_VALUES.set(el, el.value);
+  });
+}
+function formBusy(){
+  var a = document.activeElement;
+  if (a && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName) && a.closest && a.closest('form')) return true;
+  var els = document.querySelectorAll('form input, form textarea, form select');
+  for (var i = 0; i < els.length; i++) {
+    if (els[i].type === 'hidden') continue;
+    if (els[i].value !== INIT_VALUES.get(els[i])) return true;
+  }
+  return false;
+}
+function showPaused(on){
+  var p = document.getElementById('paused');
+  if (p) p.style.display = on ? 'inline' : 'none';
+}
+function refreshTick(){
+  if (!REFRESH_SEC) return;
+  if (formBusy()) { showPaused(true); setTimeout(refreshTick, 4000); return; }
+  showPaused(false);
+  location.reload();
+}
+document.addEventListener('DOMContentLoaded', function(){
+  rememberInit();
+  if (REFRESH_SEC) setTimeout(refreshTick, REFRESH_SEC * 1000);
+});
+"""
+
+
 def layout(title: str, body: str, refresh: int = 0, flash: str = "", flash_err: bool = False) -> str:
-    meta = f'<meta http-equiv="refresh" content="{refresh}">' if refresh else ""
+    meta = ""            # 不再用 <meta refresh>：它会打断表单输入，改用下面可暂停的 JS
+
     f = ""
     if flash:
         f = f'<div class="flash {"err" if flash_err else "ok"}">{esc(flash)}</div>'
@@ -232,13 +275,16 @@ def layout(title: str, body: str, refresh: int = 0, flash: str = "", flash_err: 
   <span class="sub">{esc(B.CONFIG.get("mailbox"))} · PID {esc(pids.get("bot") or "-")}</span>
   <span style="flex:1"></span>
   <a class="btn" href="/">控制台</a>
+  <a class="btn" href="/model">模型配置</a>
   <a class="btn" href="/api/status">JSON</a>
 </header>
 {f}
 {body}
-<footer>本地控制台 · 仅监听 127.0.0.1 · 模型 {esc(B.effective_model_desc())}</footer>
+<footer>本地控制台 · 仅监听 127.0.0.1 · 模型 {esc(B.effective_model_desc())}
+  <span id="paused" style="display:none"> · 正在输入，自动刷新已暂停</span></footer>
 </div>
-<script>const CSRF = "{CSI}";</script>
+<script>const CSRF = "{CSI}";var REFRESH_SEC = {int(refresh or 0)};</script>
+<script>{REFRESH_JS}</script>
 <script>{PROV_JS}</script>
 </body></html>"""
 
@@ -253,18 +299,22 @@ def fmt_time(iso: str) -> str:
 
 
 # ---------------------------------------------------------------- 页面：控制台
-def card_provider() -> str:
-    """模型接入卡片：填 base_url / api_key 就能跑，不依赖本机装了什么 CLI"""
+def card_provider(src: str = "/") -> str:
+    """模型接入卡片：填 Base URL + API Key + 模型 就能跑，不依赖任何本地 CLI"""
     st = B.provider_status()
     cfg = B.CONFIG
     levels = ("", "off", "minimal", "low", "medium", "high", "xhigh", "max")
-    backends = (("auto", "自动（填了 base_url 就直连，否则用 pi）"),
-                ("http", "http：直连模型服务（推荐，无需任何本地 CLI）"),
+    backends = (("auto", "auto（填了 Base URL 就直连，否则用 pi）"),
+                ("http", "http：直连模型服务（推荐）"),
                 ("pi", "pi：调用本机 pi CLI"))
+    protos = (("", "自动识别（推荐）"),
+              ("openai", "openai 兼容（/v1/chat/completions）"),
+              ("anthropic", "anthropic（/v1/messages）"),
+              ("ollama", "ollama 本地（/api/chat）"))
     cur_think = st["thinking"] if st["backend"] == "http" else (cfg.get("pi_thinking") or "")
     cur_model = st["model"] if st["backend"] == "http" else (cfg.get("pi_model") or "")
-    key_hint = (st["key_masked"] or ("本地 ollama 可留空" if st["protocol"] == "ollama"
-                                     else "未设置"))
+    key_state = (f"已保存 {st['key_masked']}（留空 = 不改动）" if st["has_key"]
+                 else ("本地 ollama 可留空" if st["protocol"] == "ollama" else "尚未设置（必填）"))
 
     def opts(pairs, cur):
         return "".join(f'<option value="{esc(v)}"'
@@ -273,65 +323,107 @@ def card_provider() -> str:
 
     return f"""
 <div class="card">
-  <h2>模型接入</h2>
+  <h2>模型接入（三步就能跑）</h2>
+  <div class="hint">给 <b>Base URL + API Key + 模型名</b> 就能审核，不依赖本机装了什么 CLI。
+    支持 DeepSeek / OpenAI / Moonshot / 智谱 / OpenRouter / vLLM·LiteLLM·OneAPI 自建网关 / 本机 Ollama。</div>
+
   <form method="post" action="/action" id="provform">
     <input type="hidden" name="csrf" value="{CSI}">
     <input type="hidden" name="action" value="provider">
+    <input type="hidden" name="from" value="{esc(src)}">
+
+    <div class="step"><span class="stepno">1</span><b>模型服务地址</b></div>
     <div class="row">
-      <div style="width:230px"><label>后端</label>
+      <div style="width:260px"><label>后端</label>
         <select name="backend">{opts(backends, st["backend"])}</select></div>
-      <div style="flex:2;min-width:280px"><label>Base URL（会自动补 /v1）</label>
+      <div style="flex:2;min-width:300px"><label>Base URL（会自动补 /v1，粘完整接口路径也能识别）</label>
         <input type="text" name="base_url" value="{esc(cfg.get('llm_base_url') or '')}"
                placeholder="https://api.deepseek.com 或 http://127.0.0.1:11434"></div>
-      <div style="width:160px"><label>协议</label>
-        <select name="protocol">{opts((("", "自动识别"),
-                                      ("openai", "openai（兼容 chat/completions）"),
-                                      ("anthropic", "anthropic（/v1/messages）"),
-                                      ("ollama", "ollama（本地）")),
-                                      cfg.get("llm_protocol") or "")}</select></div>
-      <div style="flex:1;min-width:200px"><label>API Key（当前：{esc(key_hint)}）</label>
-        <input type="password" name="api_key" value="" placeholder="留空 = 不改动" autocomplete="new-password"></div>
+      <div style="width:280px"><label>协议</label>
+        <select name="protocol">{opts(protos, cfg.get("llm_protocol") or "")}</select></div>
     </div>
-    <div class="row" style="margin-top:10px">
-      <div style="flex:2;min-width:260px"><label>模型名</label>
+
+    <div class="step"><span class="stepno">2</span><b>API Key</b>
+      <span class="sub">（{esc(key_state)}；当前协议：{esc(st['protocol'])}）</span></div>
+    <div class="row">
+      <div style="flex:2;min-width:300px"><label>API Key</label>
+        <input type="password" name="api_key" value="" autocomplete="new-password"
+               placeholder="sk-... （留空表示保持已保存的密钥不变）"></div>
+      <div style="width:170px"><label>清空已保存的 Key</label>
+        <select name="clear_key"><option value="">否</option><option value="1">是，清空</option></select></div>
+    </div>
+    <div class="hint">密钥只写进 <code>config.json</code>（已在 <code>.gitignore</code> 里，不会进仓库）；
+      不想落盘可用环境变量 <code>CODE_REVIEW_BOT_API_KEY</code>。页面和日志里只会看到掩码。</div>
+
+    <div class="step"><span class="stepno">3</span><b>选模型</b>
+      <span class="sub">（不确定有哪些？先点下面的「获取模型列表」，再从下拉里选）</span></div>
+    <div class="row">
+      <div style="flex:2;min-width:260px"><label>模型名（手填）</label>
         <input type="text" id="model" name="model" value="{esc(cur_model)}"
-               placeholder="deepseek-chat / gpt-4o-mini / qwen2.5-coder …"></div>
-      <div style="flex:2;min-width:260px;display:none"><label>从服务拉到的模型</label>
+               placeholder="deepseek-chat / gpt-4o-mini / qwen2.5-coder:7b …"></div>
+      <div style="flex:2;min-width:260px;display:none" id="pickbox"><label>从服务拉到的模型（选它会自动填到上面）</label>
         <select id="modelpick"></select></div>
       <div style="width:150px"><label>思考强度</label>
         <select name="thinking">{opts([(l, l or "默认") for l in levels], cur_think)}</select></div>
       <div style="flex:1;min-width:180px"><label>备用模型（上游繁忙自动切）</label>
-        <input type="text" name="fallback" value="{esc(st['fallback_model'])}"
-               placeholder="可留空"></div>
+        <input type="text" name="fallback" value="{esc(st['fallback_model'])}" placeholder="可留空"></div>
     </div>
-    <div class="row" style="margin-top:10px">
-      <div style="width:150px"><label>单次输出上限 tokens</label>
-        <input type="number" name="max_output_tokens" min="512" max="200000"
-               value="{esc(cfg.get('llm_max_output_tokens') or 8000)}"></div>
-      <div style="width:150px"><label>分批文件数</label>
-        <input type="number" name="review_chunk_files" min="0" max="500"
-               value="{esc(cfg.get('review_chunk_files'))}"></div>
-      <div style="width:170px"><label>分批字符上限</label>
-        <input type="number" name="max_chars_per_chunk" min="10000" max="2000000"
-               value="{esc(cfg.get('max_chars_per_chunk') or 120000)}"></div>
-      <div style="width:150px"><label>清空 API Key</label>
-        <select name="clear_key"><option value="">否</option><option value="1">是，清空</option></select></div>
-    </div>
+
+    <details class="adv"><summary>高级参数（一般不用改）</summary>
+      <div class="row" style="margin-top:10px">
+        <div style="width:170px"><label>单次输出上限 tokens</label>
+          <input type="number" name="max_output_tokens" min="512" max="200000"
+                 value="{esc(cfg.get('llm_max_output_tokens') or 8000)}"></div>
+        <div style="width:170px"><label>分批文件数</label>
+          <input type="number" name="review_chunk_files" min="0" max="500"
+                 value="{esc(cfg.get('review_chunk_files'))}"></div>
+        <div style="width:190px"><label>分批字符上限</label>
+          <input type="number" name="max_chars_per_chunk" min="10000" max="2000000"
+                 value="{esc(cfg.get('max_chars_per_chunk') or 120000)}"></div>
+      </div>
+    </details>
+
     <div class="row" style="margin-top:14px">
       <button class="btn primary" type="submit">保存</button>
       <button class="btn" type="button"
-              onclick="provRun('/api/provider/models', this)">获取模型列表</button>
+              onclick="provRun('/api/provider/models', this)">① 获取模型列表</button>
       <button class="btn" type="button"
-              onclick="provRun('/api/provider/test', this)">测试连通性</button>
-      <span class="hint">保存后守护进程会自动重载配置，不用重启</span>
+              onclick="provRun('/api/provider/test', this)">② 测试连通性</button>
+      <span class="hint">这两个按钮不用先保存，直接用你当前填的值</span>
     </div>
   </form>
   <div class="out" id="provout"></div>
   <div class="sub" style="margin-top:10px">当前生效：{esc(B.effective_model_desc())}</div>
-  <div class="hint">也支持命令行：<code>python bot.py model --base-url … --api-key … --set …</code>
+  <div class="hint">命令行等价：<code>python bot.py model --base-url … --api-key … --set …</code>
     · <code>python bot.py model --list</code> · <code>python bot.py model --test</code></div>
 </div>
 """
+
+
+def page_model(flash: str = "", err: bool = False) -> str:
+    """模型配置独立页面：不自动刷新，慢慢填不会被冲掉"""
+    st = B.provider_status()
+    cur = f"""
+<div class="card">
+  <h2>当前生效</h2>
+  <div class="kv">
+    <div class="k">后端</div><div>{esc(st['backend'])}
+      {'（未填 Base URL 时自动用 pi CLI）' if st['backend'] == 'pi' else ''}</div>
+    <div class="k">协议</div><div>{esc(st['protocol'])}</div>
+    <div class="k">Base URL</div><div>{esc(st['base_url'] or '（未配置）')}</div>
+    <div class="k">API Key</div><div>{esc(st['key_masked'] or '（未设置）')}</div>
+    <div class="k">模型</div><div>{esc(st['model'] or st['pi_model'] or '（未指定）')}</div>
+    <div class="k">思考强度</div><div>{esc(st['thinking'] or st['pi_thinking'] or '默认')}</div>
+    <div class="k">备用模型</div><div>{esc(st['fallback_model'] or '（不启用）')}</div>
+    <div class="k">单次输出上限</div><div>{esc(st['max_output_tokens'])} tokens</div>
+  </div>
+  <div class="hint" style="margin-top:10px">本页<b>不会自动刷新</b>；控制台首页的自动刷新在你
+    正在输入时也会自动暂停。</div>
+</div>
+"""
+    return layout("模型配置", card_provider("/model") + cur, refresh=0,
+                    flash=flash, flash_err=err)
+
 
 
 def page_dashboard(flash: str = "", err: bool = False) -> str:
@@ -631,7 +723,10 @@ def do_action(form: dict) -> tuple:
             return (f"配置未保存：{err}", True, "/")
         B.reload_config()
         reload_config()
-        return (f"模型配置已保存：{B.effective_model_desc()}", False, "/")
+        to = (form.get("from") or [""])[0]
+        if to not in ("/", "/model"):      # 白名单，不接受任意外部跳转
+            to = "/"
+        return (f"模型配置已保存：{B.effective_model_desc()}", False, to)
 
     if a == "global_req":
         val = (form.get("value") or [""])[0]
@@ -689,6 +784,9 @@ class Handler(BaseHTTPRequestHandler):
             if path in ("/", "/index.html"):
                 flash, err = self._flash_from_query(qs)
                 return self._send(200, page_dashboard(flash, err))
+            if path in ("/model", "/model.html"):
+                flash, err = self._flash_from_query(qs)
+                return self._send(200, page_model(flash, err))
             if path == "/api/status":
                 return self._send(200, json.dumps({
                     "daemon_alive": daemon_alive(),
