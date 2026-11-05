@@ -50,12 +50,39 @@ PIDFILE = STATE / "bot.pids"
 for d in (STATE, TASKS, LOCKS, WORK, LOGS, REPORTS):
     d.mkdir(parents=True, exist_ok=True)
 
+def _config_defaults() -> dict:
+    """config.example.json 里的默认配置（当“补缺字段”的底本）"""
+    p = BASE / "config.example.json"
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
 def _load_config() -> dict:
-    """优先读 config.json；仓库里只有 config.example.json 时回退到它。"""
+    """优先读 config.json；仓库里只有 config.example.json 时回退到它。
+
+    无论从哪个文件读，都会用 config.example.json 的默认值**补齐缺失字段**——
+    避免 config.json 被写坏（少字段）时整个机器人起不来 / 死循环崩溃。
+    """
     for name in ("config.json", "config.example.json"):
         p = BASE / name
         if p.exists():
-            cfg = json.loads(p.read_text(encoding="utf-8"))
+            try:
+                cfg = json.loads(p.read_text(encoding="utf-8"))
+            except Exception as e:
+                log(f"配置文件 {name} 解析失败({e})，尝试下一个", "WARN")
+                continue
+            defaults = _config_defaults()
+            if defaults:
+                missing = [k for k in defaults if k not in cfg]
+                if missing:
+                    for k in missing:
+                        cfg[k] = defaults[k]
+                    log(f"config.json 缺少字段，已用默认值补齐: {', '.join(missing[:8])}"
+                        + ("…" if len(missing) > 8 else ""), "WARN")
             cfg["_source"] = name
             return cfg
     raise SystemExit("缺少配置文件：请复制 config.example.json 为 config.json 后修改")
@@ -1703,7 +1730,12 @@ def worker_loop():
     last_scan = 0
     while True:
         try:
-            if now() - last_scan >= CONFIG["poll_interval_sec"]:
+            # 每轮先重载：配置被改坏/改新都能自愈，且改动立即生效
+            reload_config()
+            # 用 .get 兜底：配置万一缺字段也不能把 worker 循环打挂
+            # （之前直接 CONFIG["poll_interval_sec"] 会在 reload 之前抛
+            #  KeyError，进程永远卡死、任务一直卡在 SEEN）
+            if now() - last_scan >= CONFIG.get("poll_interval_sec", 180):
                 scan_once()
                 last_scan = now()
             # 取最老的待处理任务
@@ -1714,7 +1746,7 @@ def worker_loop():
                         continue
                     cand = t
                     break
-                if t.get("state") == "FAILED" and t.get("attempts", 0) < CONFIG["max_retries"]:
+                if t.get("state") == "FAILED" and t.get("attempts", 0) < CONFIG.get("max_retries", 3):
                     if t.get("next_retry_at", 0) and t["next_retry_at"] > now():
                         continue
                     cand = t

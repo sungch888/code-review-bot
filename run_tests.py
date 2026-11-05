@@ -44,7 +44,8 @@ rc |= run([sys.executable, "test_llm.py"], "8. 通用模型接入（base_url/模
 rc |= run([sys.executable, "test_approval.py"], "9. 审批闸 + 处理中确认信")
 rc |= run([sys.executable, "test_ui.py"], "10. 控制台 UI（路由/XSS/CSRF/路径穿越/模型接入/审批面板）")
 rc |= run([sys.executable, "test_providers.py"], "11. 命名配置（多套 LLM 配置保存 + 随时切换）")
-rc |= run([sys.executable, "test_no_window.py"], "12. 黑窗防护（CREATE_NO_WINDOW）")
+rc |= run([sys.executable, "test_config_robust.py"], "12. 配置健壮性（缺字段自动补齐 + worker 不死循环）")
+rc |= run([sys.executable, "test_no_window.py"], "13. 黑窗防护（CREATE_NO_WINDOW）")
 
 print("\n" + "=" * 40)
 print("全部通过" if rc == 0 else "存在失败项")
