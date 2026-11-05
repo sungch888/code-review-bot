@@ -15,7 +15,6 @@
   3. 补齐后 CONFIG 里有 worker 需要的全部关键字段
 """
 import json
-import shutil
 import sys
 from pathlib import Path
 

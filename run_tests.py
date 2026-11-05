@@ -23,7 +23,11 @@ def run(cmd, label):
     p = subprocess.run(cmd, cwd=str(BASE), capture_output=True, text=True,
                        encoding="utf-8", errors="replace")
     out = (p.stdout or "") + (p.stderr or "")
-    print(out.strip()[-4000:])
+    # 失败时打印**完整**输出（截断会把失败详情藏掉）；成功只看尾部
+    if p.returncode != 0:
+        print(out.strip())
+    else:
+        print(out.strip()[-4000:])
     return p.returncode
 
 
@@ -32,7 +36,7 @@ rc |= run([sys.executable, "-m", "pyflakes", "bot.py", "ui.py", "lib/md2html.py"
            "test_requirements.py", "test_report_spec.py", "test_ui.py",
            "test_retry.py", "test_chunk.py", "test_lock.py",
            "test_anomaly.py", "test_llm.py",
-           "test_approval.py"],
+           "test_approval.py", "test_providers.py", "test_config_robust.py"],
          "1. 静态检查 pyflakes")
 rc |= run([sys.executable, "test_requirements.py"], "2. 审核要求解析")
 rc |= run([sys.executable, "test_report_spec.py"], "3. 报告规范/校验/渲染")

@@ -94,6 +94,14 @@ class Mock(BaseHTTPRequestHandler):
         if model == "reasoning":
             return self._send(200, {"choices": [{"message": {"reasoning_content": text},
                                                  "finish_reason": "stop"}]})
+        if model == "thinkcut":
+            # 复现真实事故：推理模型把 max_tokens 全花在思考上，正文为空
+            return self._send(200, {"choices": [{"message": {"content": "",
+                                                             "reasoning_content": text},
+                                                 "finish_reason": "length"}],
+                                    "usage": {"completion_tokens": 16000,
+                                              "completion_tokens_details":
+                                                  {"reasoning_tokens": 16000}}})
         trunc = (model == "trunc")
         if self.path.startswith("/v1/messages"):
             return self._send(200, {"content": [{"type": "text", "text": text}],
@@ -253,6 +261,29 @@ expect(L.LLMError, "err-400ctx", "上下文", "上下文超限给出调小分批
 expect(L.LLMError, "empty", "没有返回内容", "空返回也算失败（不能写空报告）")
 rr = L.Provider(cfg(llm_model="reasoning")).chat([{"role": "user", "content": "U"}])
 check("推理型模型只回 reasoning_content 时也能取到正文", "结论与放行建议" in rr.text)
+# 真实事故：模型把 max_tokens 全花在思考上、正文为空、finish_reason=length
+# -> 不能拿思考当正文，应该报可操作的错
+try:
+    L.Provider(cfg(llm_model="thinkcut")).chat([{"role": "user", "content": "U"}])
+    check("思考被截断(正文空) 时报错而不是拿思考当正文", False, "没报错")
+except L.LLMError as e:
+    check("思考被截断(正文空) 时报错而不是拿思考当正文", True)
+    check("报错文案提到思考/推理 token", "思考" in str(e) or "推理" in str(e), str(e)[:120])
+    check("报错文案给出可操作建议", "llm_max_output_tokens" in str(e), str(e)[:160])
+# 关思考开关
+L.Provider(cfg(llm_model="normal")).chat([{"role": "user", "content": "U"}])
+check("默认关思考：发 thinking.disabled",
+      Mock.calls[-1]["body"].get("thinking", {}).get("type") == "disabled",
+      str(Mock.calls[-1]["body"])[:200])
+L.Provider(cfg(llm_model="normal", llm_disable_thinking=False)).chat(
+    [{"role": "user", "content": "U"}])
+check("显式保留思考时不发 thinking.disabled",
+      "thinking" not in Mock.calls[-1]["body"], str(Mock.calls[-1]["body"])[:200])
+L.Provider(cfg(llm_model="normal", llm_thinking="high")).chat(
+    [{"role": "user", "content": "U"}])
+check("思考强度开启时优先用 reasoning_effort（不发 disabled）",
+      Mock.calls[-1]["body"].get("reasoning_effort") == "high"
+      and "thinking" not in Mock.calls[-1]["body"], str(Mock.calls[-1]["body"])[:200])
 tr = L.Provider(cfg(llm_model="trunc")).chat([{"role": "user", "content": "U"}])
 check("finish_reason=length 被识别为截断", tr.truncated, tr.finish_reason)
 bad = L.Provider(cfg(llm_base_url="http://127.0.0.1:1", llm_timeout_sec=5))

@@ -18,7 +18,7 @@
     "llm_model":     "deepseek-chat"
     "llm_thinking":  "" | off | minimal | low | medium | high | xhigh | max
     "llm_temperature": 0.2
-    "llm_max_output_tokens": 8000
+    "llm_max_output_tokens": 16000
     "llm_timeout_sec": 600
     "llm_extra_body": {"thinking": {"type": "enabled"}}   （透传给服务商的任意字段）
     "llm_headers":   {"X-foo": "bar"}                      （自定义请求头）
@@ -172,6 +172,10 @@ class Provider:
                         or os.environ.get(ENV_KEY, "").strip())
         self.model = (cfg.get("llm_model") or "").strip()
         self.thinking = (cfg.get("llm_thinking") or "").strip().lower()
+        # 默认**关掉模型自带的思考**：很多推理型模型会自己开思考，把 max_tokens
+        # 全花在 reasoning 上，正文为空、finish_reason=length（表现为“输出被截断”）。
+        # 需要思考时把 llm_thinking 设成 low/medium/high 等。
+        self.disable_thinking = bool(cfg.get("llm_disable_thinking", True))
         self.temperature = cfg.get("llm_temperature", 0.2)
         self.max_output_tokens = int(cfg.get("llm_max_output_tokens")
                                      or DEFAULT_MAX_OUTPUT_TOKENS)
@@ -306,12 +310,20 @@ class Provider:
             eff = _THINKING_EFFORT.get(self.thinking)
             if eff:
                 payload["reasoning_effort"] = eff
+            elif self.disable_thinking:
+                # 显式关思考（否则模型自带的推理会吃光输出预算）
+                payload["thinking"] = {"type": "disabled"}
         payload.update(self.extra_body or {})
         return payload
 
     @staticmethod
     def _extract(d: dict, protocol: str):
-        """从各家返回里取出正文 + finish_reason"""
+        """从各家返回里取出正文 + finish_reason
+
+        注意：**不要**把 reasoning_content 当正文。
+        推理型模型思考没写完时 finish_reason=length、content 为空，
+        若拿思考内容当报告，报告里会全是模型的内心戏（而且永远“写不完”）。
+        """
         if protocol == "ollama":
             msg = d.get("message") or {}
             return (msg.get("content") or d.get("response") or "",
@@ -325,11 +337,17 @@ class Provider:
             return "", ""
         c = choices[0]
         msg = c.get("message") or {}
+        finish = (c.get("finish_reason") or "")
         text = msg.get("content") or ""
         if not text:
-            # 推理型模型有时把正文放在 reasoning_content
-            text = msg.get("reasoning_content") or c.get("text") or ""
-        return text, (c.get("finish_reason") or "")
+            rc = msg.get("reasoning_content") or ""
+            # finish_reason=length 说明**思考被截断**，此时 reasoning_content 只是
+            # 半截内心戏，不能当正文用；其它情况（stop）则可以当正文。
+            if rc and finish != "length":
+                text = rc
+            else:
+                text = c.get("text") or ""
+        return text, finish
 
     def chat(self, messages: list, model: str = "", max_tokens: int = 0,
              temperature=None, timeout: int = 0) -> ChatResult:
@@ -346,6 +364,16 @@ class Provider:
             raw = json.dumps(d, ensure_ascii=False)[:400]
             if is_busy_text(raw):
                 raise ProviderBusy("模型返回空内容（上游可能过载或流被掐断）", raw=raw)
+            # 推理型模型思考没写完：正文空 + finish_reason=length
+            if finish == "length":
+                usage = d.get("usage") or {}
+                rt = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
+                if rt:
+                    raise LLMError(
+                        f"模型把 {rt} 个 token 全用在了思考(推理)上、正文为空，"
+                        "导致输出被截断。请把 llm_disable_thinking 设为 true"
+                        "（默认已开），或调大 llm_max_output_tokens、"
+                        "降低 llm_thinking 档位。", raw=raw)
             raise LLMError(f"模型没有返回内容：{raw}", raw=raw)
         used = (model or self.model)
         return ChatResult(text.strip(), finish, d.get("model") or used,

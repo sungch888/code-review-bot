@@ -314,8 +314,9 @@ deepseek-pro  deepseek-v4-pro api…         —             激活 编辑 删�
 | `llm_api_key` | 空 | 留空时可用环境变量 `CODE_REVIEW_BOT_API_KEY`（不想落盘就用它） |
 | `llm_model` | 空 | 模型原名（`deepseek-chat`、`gpt-4o-mini`、`qwen2.5-coder:7b`…） |
 | `llm_thinking` | 空 | `off/minimal/low/medium/high/xhigh/max`，自动翻译成各家写法 |
+| `llm_disable_thinking` | `true` | **默认关掉模型自带思考**。推理型模型会自己开思考，把 `max_tokens` 全花在 reasoning 上→正文为空、`finish_reason=length`（表现为“输出被截断”）。要思考就把思考强度调上去 |
 | `llm_temperature` | `0.2` | 采样温度 |
-| `llm_max_output_tokens` | `8000` | 单次输出上限；被截断会自动续写一次 |
+| `llm_max_output_tokens` | `16000` | 单次输出上限；被截断会**连续续写**（最多 4 轮）直到写完 |
 | `llm_timeout_sec` | `600` | 单次请求超时 |
 | `llm_extra_body` | `{}` | 透传服务商自定义字段（如 `{"thinking":{"type":"enabled"}}`） |
 | `llm_headers` | `{}` | 自定义请求头（网关租户、路由标签等） |
@@ -335,6 +336,32 @@ pi 后端让模型自己用 read/ls 工具翻代码；直连后端不依赖工�
 
 行号显式给出，模型引用行号时不用猜，也就没法编造；单文件超过
 `max_file_chars` 会截断并写明「仅给出前 N 行」。
+
+### “输出被截断”到底是怎么回事（一个真实的坑）
+
+最早一批报告里，12 个批次**全部**报「输出被截断(finish_reason=length)」。看着像
+“模型写不下”，实际上抓包发现是：
+
+```
+completion_tokens: 16000
+completion_tokens_details: {reasoning_tokens: 16000}   ← 全花在思考上
+content 长度: 0                                        ← 正文一个字没有
+reasoning_content 长度: 56979                          ← 只有半截内心戏
+```
+
+**推理型模型默认会自己开思考**，把 `max_tokens` 预算全部吃掉，正文一个字都吐不出来。
+更糟的是当时的取值逻辑会把 `reasoning_content`（思考过程）**当成报告正文**，
+于是报告里全是模型的内心戏，而且永远“写不完”。
+
+三处一起修：
+
+1. **默认显式关思考**（`llm_disable_thinking: true` → 发送 `thinking:{"type":"disabled"}`）；
+2. **不再把思考内容当正文**——`finish_reason=length` 时 `reasoning_content` 一律不算正文；
+   万一还是空正文，报错会直接告诉你“模型把 N 个 token 花在思考上了”；
+3. **分批阶段只输出“问题清单”**，不再每批都写全章节（章节统一由汇总阶段生成），
+   单批输出量降到 1/4 以内；**续写改成最多 4 轮**（原来只续 1 次）。
+
+同一份 119 文件的代码，修复前：98s、截断、正文 0 字；修复后：17s、正常输出 6817 字。
 
 ### 错误都会被翻译成人话
 

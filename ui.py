@@ -453,6 +453,11 @@ def provider_form(mode: str, name: str = "") -> str:
                placeholder="deepseek-chat / gpt-4o-mini / qwen2.5-coder:7b"></div>
       <div style="width:180px"><label>思考强度</label>
         <select name="thinking">{opts([(l, l or "默认") for l in levels], e.get('thinking') or '')}</select></div>
+      <div style="width:230px"><label>模型自带思考</label>
+        <select name="disable_thinking">
+          <option value="1"{' selected' if e.get('disable_thinking', True) else ''}>关掉（推荐）</option>
+          <option value="0"{'' if e.get('disable_thinking', True) else ' selected'}>保留</option>
+        </select></div>
     </div>
     <div class="row" style="display:none" id="pickbox">
       <div style="flex:2;min-width:240px"><label>从服务拉到的模型（选它会自动填到上面）</label>
@@ -965,7 +970,8 @@ def do_action(form: dict) -> tuple:
         g = lambda k: (form.get(k) or [""])[0]
         return {"base_url": g("base_url"), "protocol": g("protocol") or "openai",
                 "api_key": g("api_key"), "model": g("model"), "thinking": g("thinking"),
-                "max_output_tokens": g("max_output_tokens") or "8000",
+                "disable_thinking": g("disable_thinking") != "0",
+                "max_output_tokens": g("max_output_tokens") or "16000",
                 "temperature": g("temperature") or "0.2"}
 
     def _save_fb():
