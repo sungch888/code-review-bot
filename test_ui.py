@@ -70,6 +70,14 @@ def flash_of(hdr):
 
 
 def main():
+    # 回归：直接 `bot.py run` 启动时也要写 pid 文件，
+    # 否则控制台会一直显示「守护进程未运行」（实际它活着）
+    src = (BASE / "bot.py").read_text(encoding="utf-8")
+    run_all_src = src.split("def run_all")[1][:900]
+    check("run_all() 会写 pid 文件", "PIDFILE.write_text" in run_all_src,
+          run_all_src[:120])
+    check("run_all() 退出时清理 pid 文件", "PIDFILE.unlink" in run_all_src)
+
     # --- 造一个带 XSS payload 的任务 + 报告 ---
     xss_mid = "msg_UItestXSS"
     task = {

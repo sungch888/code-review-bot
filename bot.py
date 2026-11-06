@@ -1877,13 +1877,26 @@ def watch_supervisor():
 def run_all():
     """单进程守护：watch 线程 + worker 主线程"""
     import threading
+    # 写 pid 文件：不管是用 `bot.py start` 还是直接 `bot.py run` 起的，
+    # 控制台都能看到「守护进程存活」；退出时删掉。
+    try:
+        PIDFILE.write_text(json.dumps({"bot": os.getpid()}), encoding="utf-8")
+    except Exception as e:
+        log(f"写 pid 文件失败（不影响运行）: {e}", "WARN")
     th = threading.Thread(target=watch_supervisor, daemon=True, name="watch")
     th.start()
-    log("机器人已启动：watch 通道 + worker 队列")
+    log(f"机器人已启动：watch 通道 + worker 队列 (pid={os.getpid()})")
     try:
         worker_loop()
     except KeyboardInterrupt:
         pass
+    finally:
+        try:
+            cur = json.loads(PIDFILE.read_text(encoding="utf-8"))
+            if cur.get("bot") == os.getpid():
+                PIDFILE.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------- daemon control
