@@ -36,7 +36,8 @@ rc |= run([sys.executable, "-m", "pyflakes", "bot.py", "ui.py", "lib/md2html.py"
            "test_requirements.py", "test_report_spec.py", "test_ui.py",
            "test_retry.py", "test_chunk.py", "test_lock.py",
            "test_anomaly.py", "test_llm.py",
-           "test_approval.py", "test_providers.py", "test_config_robust.py"],
+           "test_approval.py", "test_providers.py", "test_config_robust.py",
+           "test_methodology.py"],
          "1. 静态检查 pyflakes")
 rc |= run([sys.executable, "test_requirements.py"], "2. 审核要求解析")
 rc |= run([sys.executable, "test_report_spec.py"], "3. 报告规范/校验/渲染")
@@ -49,7 +50,8 @@ rc |= run([sys.executable, "test_approval.py"], "9. 审批闸 + 处理中确认�
 rc |= run([sys.executable, "test_ui.py"], "10. 控制台 UI（路由/XSS/CSRF/路径穿越/模型接入/审批面板）")
 rc |= run([sys.executable, "test_providers.py"], "11. 命名配置（多套 LLM 配置保存 + 随时切换）")
 rc |= run([sys.executable, "test_config_robust.py"], "12. 配置健壮性（缺字段自动补齐 + worker 不死循环）")
-rc |= run([sys.executable, "test_no_window.py"], "13. 黑窗防护（CREATE_NO_WINDOW）")
+rc |= run([sys.executable, "test_methodology.py"], "13. 审核方法论注入 + 报告不泄露来源")
+rc |= run([sys.executable, "test_no_window.py"], "14. 黑窗防护（CREATE_NO_WINDOW）")
 
 print("\n" + "=" * 40)
 print("全部通过" if rc == 0 else "存在失败项")

@@ -15,9 +15,9 @@ GOOD = """# 代码审核报告
 本项目为订单服务，整体质量评分 35 分（满分 100）。主要扣分在安全性。
 
 ## 问题清单
-| 编号 | 级别 | 文件:行号 | 问题描述 | 修改建议 |
-| --- | --- | --- | --- | --- |
-| 1 | 严重 | app.py:8 | SQL 拼接 | 改参数化 |
+| 编号 | 级别 | 文件:行号 | 问题描述 | 成因 | 后果 | 修改建议 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 严重 | app.py:8 | SQL 拼接 | 未用参数化查询，请求参数直接拼进语句 | 攻击者可构造参数读取或删改整库 | 改参数化 |
 
 ## 严重与高危问题详述
 见上表第 1 条。
@@ -52,7 +52,8 @@ check("规范渲染出全部章节标题",
       all(s["title"] in txt for s in bot.REPORT_SPEC["sections"]),
       txt[:200])
 check("提示词可 format（四占位符）",
-      "{" not in bot.REVIEW_PROMPT.format(src="S", rpt="R", extra="", sections=txt).replace("{src}", "").replace("{rpt}", ""),
+      "{" not in bot.REVIEW_PROMPT.format(src="S", rpt="R", extra="", sections=txt,
+                                          methodology=bot.load_methodology(True)).replace("{src}", "").replace("{rpt}", ""),
       "存在未替换花括号")
 
 # 2. 校验器
@@ -63,7 +64,7 @@ bad = GOOD.replace("## 安全性专项检查", "## 安全检查")
 issues = bot.validate_report(bad)
 check("缺章节能被发现", any("安全性专项检查" in i for i in issues), str(issues))
 
-bad2 = GOOD.replace("| 编号 | 级别 | 文件:行号 | 问题描述 | 修改建议 |",
+bad2 = GOOD.replace("| 编号 | 级别 | 文件:行号 | 问题描述 | 成因 | 后果 | 修改建议 |",
                     "| 序号 | 等级 | 位置 | 问题 | 建议 |")
 issues = bot.validate_report(bad2)
 check("表头不符能被发现", any("列名" in i or "编号" in i for i in issues), str(issues))
