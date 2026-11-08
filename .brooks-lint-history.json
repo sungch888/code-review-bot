@@ -1,0 +1,13 @@
+[
+  {
+    "date": "2026-11-08",
+    "mode": "PR Review",
+    "score": 21,
+    "findings": {
+      "critical": 3,
+      "warning": 6,
+      "suggestion": 4
+    },
+    "scope": "commits 6050816..cdee33e + 全仓结构抽检 (bot.py 3649 行 / ui.py 1256 行 / lib 1016 行)"
+  }
+]

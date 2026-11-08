@@ -326,6 +326,90 @@ def main():
         check("重试用尽会回信告知发件人", len(sent) == 1 and "msg_fail3" in sent[0][0],
               str(sent))
 
+        # ---------- H. 配置重载不能破坏正在被读的那份配置 ----------
+        # 旧实现是 CONFIG.clear() + CONFIG.update()：读者会看到一份空 dict -> KeyError
+        B.CONFIG["_tick_probe"] = 1
+        held = B.CONFIG                      # 模拟：worker 已经拿到手的引用
+        real_load = B._load_config
+        B._load_config = lambda: dict(held, _source="config.json", _tick_probe=2)
+        try:
+            B.reload_config()
+        finally:
+            B._load_config = real_load
+        check("重载后旧引用仍是完整配置（不是被清空）",
+              bool(held.get("skip_dirs")) and held.get("max_workers") is not None,
+              f"skip_dirs={held.get('skip_dirs')!r}")
+        check("重载后全局 CONFIG 换成新配置", B.CONFIG.get("_tick_probe") == 2,
+              str(B.CONFIG.get("_tick_probe")))
+        check("重载是换新 dict，不是原地清空旧对象（读者不会看到空配置）",
+              B.CONFIG is not held, "同一对象被 clear+update，读者有窗口读到空 dict")
+        B.CONFIG.pop("_tick_probe", None)
+
+        # 并发：一边重载一边读（不要求能复现 KeyError，但至少不能抛）
+        errs = []
+        stop = [False]
+
+        def reader():
+            while not stop[0]:
+                try:
+                    B.CONFIG["skip_dirs"]
+                    B.CONFIG["max_review_files"]
+                except Exception as e:
+                    errs.append(f"{type(e).__name__}: {e}")
+                    return
+
+        real_log = B.log
+        B.log = lambda *a, **k: None
+        th = threading.Thread(target=reader, daemon=True)
+        th.start()
+        tick = [10]
+
+        def churn():
+            tick[0] += 1
+            return dict(held, _source="config.json", _tick_probe=tick[0])
+
+        B._load_config = churn
+        try:
+            for _ in range(3000):
+                B.reload_config()
+        finally:
+            stop[0] = True
+            th.join(timeout=2)
+            B._load_config = real_load
+            B.log = real_log
+        check("并发重载 3000 次时读配置不抛异常", not errs, str(errs[:2]))
+        B.CONFIG.pop("_tick_probe", None)
+
+        # ---------- I. 确认信不能吞掉 worker 的进展 ----------
+        for f in B.TASKS.glob("*.json"):
+            f.unlink()
+        mid_ack = "msg_ack_race"
+        B.save_task({"message_id": mid_ack, "subject": "代码审核 - x",
+                     "state": "SEEN", "attempts": 1,
+                     "created_at_ts": B.now() - 999})
+        B.CONFIG["ack_enabled"] = True
+        B.CONFIG["ack_timeout_sec"] = 300
+        old_ack = B.send_ack
+
+        def fake_ack(_task):
+            # 模拟：发确认信的网络调用期间，另一个 worker 把任务推进了
+            cur = B.load_task(mid_ack)
+            cur["state"] = "DOWNLOADED"
+            cur["attempts"] = 3
+            B.save_task(cur)
+
+        B.send_ack = fake_ack
+        try:
+            B.ack_sweep()
+        finally:
+            B.send_ack = old_ack
+        after = B.load_task(mid_ack)
+        check("确认信不会把状态回写成 SEEN", after["state"] == "DOWNLOADED",
+              str(after["state"]))
+        check("确认信不会抹掉重试次数", after["attempts"] == 3, str(after["attempts"]))
+        check("确认信标记确实写进去了", bool(after.get("ack_sent_at")))
+        check("确认信不改其他字段", after["subject"] == "代码审核 - x")
+
         # ---------- G. 配置默认值 ----------
         ex = (BASE / "config.example.json").read_text(encoding="utf-8")
         for k in ("max_workers", "llm_max_concurrency", "chunk_workers",

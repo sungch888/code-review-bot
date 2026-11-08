@@ -424,6 +424,20 @@ def main():
             check("reload_config 让守护进程读到新配置",
                   B.CONFIG.get("review_requirements") == "SENTINEL",
                   B.CONFIG.get("review_requirements"))
+
+            # UI 进程也是多线程（ThreadingHTTPServer）：重载必须整份替换，
+            # 否则并发请求会在 clear()+update() 之间读到空配置
+            held = B.CONFIG
+            real_load = B._load_config
+            B._load_config = lambda: dict(held, _source="config.json", _tick=1)
+            try:
+                ui.reload_config()
+            finally:
+                B._load_config = real_load
+            check("UI 重载后旧引用仍完整", bool(held.get("skip_dirs")),
+                  f"skip_dirs={held.get('skip_dirs')!r}")
+            check("UI 重载是换新 dict（不原地清空）", B.CONFIG is not held)
+            B.CONFIG.pop("_tick", None)
         except Exception as e:
             check("模型接入测试未抛异常", False, str(e))
 

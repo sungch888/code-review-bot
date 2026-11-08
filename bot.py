@@ -109,24 +109,29 @@ def _load_config() -> dict:
 
 CONFIG = _load_config()
 KEYWORD = CONFIG["subject_keyword"]
+_LOCK_CONFIG = threading.RLock()
 
 
 def reload_config() -> None:
     """重新读盘配置：UI / CLI 改了 config.json 后无需重启守护进程
 
-    守护进程可能连续跑几天，不能要求“改完模型配置必须重启”。
+    并发安全：**整份替换**而不是 clear()+update()。
+    守护进程里有多个 worker 线程会在同一时刻读 CONFIG；
+    原写法会让读者在一瞬间看到一份空 dict（实测 KeyError: 'skip_dirs'）。
+    引用赋值是原子的：读者要么看旧配置、要么看新配置，两者都是完整的。
     """
-    global KEYWORD
-    try:
-        fresh = _load_config()
-    except Exception as e:
-        log(f"重载配置失败（沿用旧值）: {e}", "WARN")
-        return
-    if fresh != CONFIG:
-        CONFIG.clear()
-        CONFIG.update(fresh)
+    global CONFIG, KEYWORD
+    with _LOCK_CONFIG:
+        try:
+            fresh = _load_config()
+        except Exception as e:
+            log(f"重载配置失败（沿用旧值）: {e}", "WARN")
+            return
+        if fresh == CONFIG:
+            return
+        CONFIG = fresh
         KEYWORD = fresh.get("subject_keyword", KEYWORD)
-        log("配置已重载")
+    log("配置已重载")
 
 # ---------------------------------------------------------------- 并发与限速
 # 并发是两层：
@@ -614,9 +619,36 @@ def load_task(mid: str):
 def save_task(task: dict) -> None:
     task["updated_at"] = iso()
     p = task_path(task["message_id"])
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(task, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, p)
+    # 临时文件名必须唯一：两个线程同时写同一个任务时，共用 .json.tmp 会写坏
+    tmp = p.with_name(f"{p.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        tmp.write_text(json.dumps(task, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, p)
+    finally:
+        tmp.unlink(missing_ok=True)      # 写失败时不留垃圾临时文件
+
+
+def update_task(mid: str, mutate) -> dict:
+    """字段级更新：只把 mutate 改过的字段叠到**磁盘最新副本**上
+
+    用于「校验/发送完再写回”这种跳了网络调用的写（如 ack_sweep 的 ack_sent_at）：
+    直接 save_task(旧副本) 会把别人在这段时间里推进的 state/attempts 回写成旧值（实测复现）。
+    返回值：更新后的任务；任务已不存在返回 None。
+    """
+    for _ in range(5):
+        cur = load_task(mid)
+        if cur is None:
+            return None
+        before = dict(cur)
+        mutate(cur)
+        changed = {k: v for k, v in cur.items() if before.get(k) != v}
+        if not changed:
+            return cur
+        latest = load_task(mid) or cur
+        latest.update(changed)          # 只叠加我们改过的字段
+        save_task(latest)
+        return latest
+    return load_task(mid)
 
 
 def all_tasks():
@@ -2303,13 +2335,16 @@ def approve_task(mid: str, approver: str = "") -> dict:
     if not rpt.exists():
         raise RuntimeError("找不到报告目录，无法发送")
     send_reply(t, rpt)
-    t["state"] = "REPLIED"
-    t["replied_at"] = iso()
-    t["approved_at"] = iso()
-    if approver:
-        t["approved_by"] = approver
-    t["last_error"] = None
-    save_task(t)
+    # 发报告是网络调用（秒级），期间任务可能被旁路改过：只叠加本函数的字段
+    def _mark_approved(x):
+        x["state"] = "REPLIED"
+        x["replied_at"] = iso()
+        x["approved_at"] = iso()
+        if approver:
+            x["approved_by"] = approver
+        x["last_error"] = None
+
+    t = update_task(mid, _mark_approved) or t
     log(f"[{mid}] 审批通过，报告已发送")
     return t
 
@@ -2378,12 +2413,19 @@ def ack_sweep() -> int:
             continue
         try:
             with Lock(f"ack-{t['message_id']}", timeout=5):
-                t2 = load_task(t["message_id"]) or t
-                if t2.get("ack_sent_at"):
+                mid = t["message_id"]
+                t2 = load_task(mid)
+                if t2 is None or t2.get("ack_sent_at"):
                     continue
                 send_ack(t2)
-                t2["ack_sent_at"] = iso()
-                save_task(t2)
+
+                # 只写 ack_sent_at 一个字段（update_task 基于磁盘最新副本叠加）：
+                # 发信是秒级的网络调用，这期间 worker 可能已经把任务推进到
+                # DOWNLOADED/REVIEWED；整份回写会把这些进展吞掉（已复现）。
+                def _mark_ack(x):
+                    x["ack_sent_at"] = iso()
+
+                update_task(mid, _mark_ack)
                 sent += 1
         except Exception as e:
             log(f"确认信发送失败 {t.get('message_id')}: {e}", "WARN")

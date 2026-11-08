@@ -853,12 +853,12 @@ def reload_config() -> None:
 
     model/全局要求等动作是调 bot.py 子进程完成的，子进程只改了文件；
     不重载就会出现「已经保存了，但页面/API 还是旧值」。
+
+    统一走 B.reload_config()（整份替换）：本进程是 ThreadingHTTPServer，
+    多个请求同时在跑，旧写法 clear()+update() 会让别的请求读到空配置。
     """
     try:
-        fresh = B._load_config()
-        B.CONFIG.clear()
-        B.CONFIG.update(fresh)
-        B.KEYWORD = fresh.get("subject_keyword", B.KEYWORD)
+        B.reload_config()
     except Exception:
         pass
 
