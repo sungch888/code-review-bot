@@ -871,6 +871,13 @@ def enqueue(msg: dict) -> str:
         if t.get("attempts", 0) >= CONFIG["max_retries"]:
             return "FAILED_SKIP"
 
+    # 正在处理中的任务：**不动它**
+    # 以前无条件设回 SEEN，poll 扫描会把 worker 正在处理的任务拉回队列 ->
+    # 多 worker 时第二个 worker 会抢到同一个任务，重复下载/重复审核/重复发信。
+    # （状态机会拒绝这次转移，但正确做法是这里根本不该尝试。）
+    if t.get("state") in (State.DOWNLOADED, State.REVIEWED, State.AWAITING_APPROVAL):
+        return "DONE_SKIP_IN_PROGRESS"
+
     # 状态回退：重新入队（FAILED -> SEEN 是合法转移）
     set_state(t, State.SEEN, "enqueue")
     t["next_retry_at"] = 0
@@ -2362,6 +2369,55 @@ def _review_via_pi(mid: str, src: Path, rpt: Path, files, extra: str, warnings: 
     return review_pipeline(mid, src, rpt, files, extra, warnings, baseline, backend)
 
 
+def build_summary_from_report(md_text: str, n_new: int = 0) -> str:
+    """从最终报告里提炼「邮件摘要」（≤15 行纯中文）
+
+    HTTP 后端不会像 pi 那样让模型额外写 summary.md，
+    以前只能用一句兼底文案糊弄发件人——而报告里明明有
+    「总体评价」「结论与放行建议」这些最该给发件人的内容。
+    """
+    text = str(md_text or "")
+    lines_out = []
+
+    def section(title):
+        m = re.search(r"^#{2,3}\s*" + re.escape(title) + r"\s*$([\s\S]*?)(?=^#{2,3}\s|\Z)",
+                      text, re.M)
+        return m.group(1).strip() if m else ""
+
+    ov = section("总体评价")
+    if ov:
+        # 去掉表格/代码块，取第一段散文
+        para = re.split(r"\n\s*\n", ov)[0]
+        para = re.sub(r"```[\s\S]*?```", "", para).strip()
+        para = re.sub(r"^\|.*$", "", para, flags=re.M).strip()
+        para = re.sub(r"\s+", " ", para)
+        if para:
+            lines_out.append(para[:220])
+
+    con = section("结论与放行建议")
+    verdict = ""
+    m = re.search(r"(可放行|修改后放行|不建议放行)", con or text)
+    if m:
+        verdict = m.group(1)
+    rows = extract_issue_rows(text)
+    if not n_new:
+        n_new = len(rows)
+    blocking = [r for r in rows if r.get("level") in ("严重", "高危", "高", "严重 ")]
+    if verdict:
+        lines_out.append(f"结论：{verdict}；共 {n_new} 条问题，其中严重/高危 {len(blocking)} 条。")
+    else:
+        lines_out.append(f"共 {n_new} 条问题，其中严重/高危 {len(blocking)} 条。")
+
+    # 阻塞项：取最严重的几条（描述截断）
+    for r in blocking[:5]:
+        lines_out.append(f"- [{r.get('level')}] {r.get('loc')} {_one_line(r.get('desc'), 90)}")
+    if len(blocking) > 5:
+        lines_out.append(f"- （另有 {len(blocking) - 5} 条严重/高危项见附件报告）")
+
+    out = "\n".join(lines_out).strip()
+    return out[:1500] if out else ""
+
+
 def run_review(task, extra: str = "", baseline: dict = None) -> Path:
     mid = task["message_id"]
     src = WORK / mid / "src"
@@ -2439,8 +2495,14 @@ def run_review(task, extra: str = "", baseline: dict = None) -> Path:
 
     summ = rpt / "summary.md"
     if not summ.exists() or summ.stat().st_size < 20:
-        summ.write_text("代码包已完成静态代码审核，详细结论见附件报告。", encoding="utf-8")
-        warnings.append("摘要缺失，已使用兼底文案")
+        # HTTP 后端没有 summary.md：从最终报告里提炼（总评价 + 结论 + 阻塞项）
+        derived = build_summary_from_report(final_txt, task.get("new_issues") or 0)
+        if derived:
+            summ.write_text(redact(derived), encoding="utf-8")
+            log(f"[{mid}] 已从报告生成摘要 {summ.stat().st_size} bytes")
+        else:
+            summ.write_text("代码包已完成静态代码审核，详细结论见附件报告。", encoding="utf-8")
+            warnings.append("摘要缺失，已使用兼底文案")
 
     task["report_warnings"] = warnings
     log(f"[{mid}] 审核完成: {md} ({md.stat().st_size} bytes)")

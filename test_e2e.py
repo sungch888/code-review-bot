@@ -561,6 +561,44 @@ def main():
         os.environ.pop("PI_STUB_MODE", None)
         env.close()
 
+    # ================= S11 poll 扫描不能把「正在处理」的任务拉回队列 ============
+    env = Env()
+    try:
+        env.add_task("msg_s11", "代码审核 - 扫描不抢活", SMALL)
+        t = B.load_task("msg_s11")
+        t["state"] = B.State.DOWNLOADED          # 模拟：worker 正在处理
+        B.save_task(t)
+        r = B.enqueue(dict(env.msgs["msg_s11"], message_id="msg_s11"))
+        after = B.load_task("msg_s11")
+        check("扫描不会把处理中的任务拉回 SEEN", after["state"] == B.State.DOWNLOADED,
+              str(after["state"]))
+        check("扫描对处理中的任务返回「进行中」而不是重新入队",
+              r == "DONE_SKIP_IN_PROGRESS", r)
+    finally:
+        env.close()
+
+    # ================= S12 摘要从报告生成（不再用兼底文案）=================
+    env = Env()
+    try:
+        env.add_task("msg_s12", "代码审核 - 摘要", SMALL)
+        env.run("msg_s12")
+        t = B.load_task("msg_s12")
+        summ = (Path(t["report"]) / "summary.md").read_text(encoding="utf-8")
+        check("摘要不是那句兼底文案",
+              "代码包已完成静态代码审核，详细结论见附件报告。" not in summ, summ[:80])
+        check("摘要含结论档位",
+              any(k in summ for k in ("可放行", "修改后放行", "不建议放行")), summ[:200])
+        check("摘要含问题条数", "条问题" in summ, summ[:200])
+        check("摘要在 15 行以内", len(summ.splitlines()) <= 15, str(len(summ.splitlines())))
+        body = env.body("msg_s12")
+        check("回信正文里的摘要是提炼后的内容",
+              "代码包已完成静态代码审核，详细结论见附件报告。" not in body, body[:300])
+        check("报告注意事项里没有「摘要缺失」",
+              not any("摘要缺失" in w for w in (t.get("report_warnings") or [])),
+              str(t.get("report_warnings")))
+    finally:
+        env.close()
+
     srv.close()
     srv5.close()
     print(f"\n{PASS}/{PASS + FAIL} 通过")
