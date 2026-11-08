@@ -1,0 +1,522 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""端到端（e2e）harness：一个任务从「收邮件」到「回信」跑完整条链路
+
+为什么需要它：
+  真实的 bug 全落在「只有真实环境才走到」的路径上——
+  A 的 `per_batch` IndexError（只在分批+无基线时触发）、
+  B 的直链报错文案（只有真实 CDN 会返回 400）、
+  C 的确认信回写（只有并发时才有那个窗口）。
+  单元测试覆盖的是零件，这里用「假 agently-cli + 假模型」把整机跑起来。
+
+harness 提供：
+  - 假 CLI：message +read / attachment +download / message +reply（记录发出去的正文与附件）
+  - 假模型：按提示词类型返回不同的罐装报告（单批 / 分批 / 汇总 / 修复）
+  - 临时 WORK/TASKS/LOCKS/LOGS/配置，不碰线上数据
+  - 可选本地 HTTP 服务：模拟超大附件直链（含「需要 MAIL5K」的 400）
+
+覆盖场景：
+  S1 正常单包：SEEN -> DOWNLOADED -> REVIEWED -> REPLIED（报告 md/html + 回信附件）
+  S2 大包分批 + 无基线（A 的 IndexError 回归）
+  S3 同一项目第 2 轮（A 的闭环端到端：基线识别 + 跟踪表 + 回信闭环数字）
+  S4 超大附件直链需要登录态（B 的回归：如实说明 + 3 种替代办法）
+  S5 直链带 Cookie 能取回（B 的功能）
+  S6 模型失败 -> FAILED + 指数退避（C 的回归）
+  S7 两个任务并发跑，互不踩（C 的端到端）
+  S8 处理期间发确认信，不回写 worker 的进展（C2 的端到端）
+"""
+import http.server
+import io
+import sys
+import tempfile
+import threading
+import time
+import types
+import urllib.parse
+import zipfile
+from pathlib import Path
+
+BASE = Path(__file__).resolve().parent
+sys.path.insert(0, str(BASE))
+
+import bot as B  # noqa: E402
+
+PASS = 0
+FAIL = 0
+
+
+def check(name, cond, extra=""):
+    global PASS, FAIL
+    if cond:
+        PASS += 1
+        print(f"[PASS] {name}")
+    else:
+        FAIL += 1
+        print(f"[FAIL] {name}  {extra}")
+
+
+# ---------------------------------------------------------------- 罐装报告
+def make_zip(files: dict) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, text in files.items():
+            zf.writestr(name, text)
+    return buf.getvalue()
+
+
+ISSUES = [("严重", "app/main.py:10", "SQL 字符串拼接", "直接拼参数", "可读全库"),
+          ("高危", "app/store.py:8", "缓存无过期", "只在写入处设值", "内存持续增长"),
+          ("中危", "app/api.py:22", "无入参校验", "校验分散", "可被负数下单")]
+
+
+def report_text(tracking=None) -> str:
+    rows = "\n".join(
+        f"| {i} | {lv} | {loc} | {desc} | {cause} | {cons} | 改成参数化并统一校验 |"
+        for i, (lv, loc, desc, cause, cons) in enumerate(ISSUES, 1))
+    track = ""
+    if tracking:
+        trows = "\n".join(
+            f"| {i} | {lv} | {loc} {desc} | {verdict} | app/main.py:{30 + i} | 见代码 |"
+            for i, (lv, loc, desc, verdict) in enumerate(tracking, 1))
+        track = ("## 上轮问题跟踪\n\n"
+                 "| 编号 | 级别 | 上轮问题 | 本轮判定 | 证据 | 说明 |\n"
+                 "| --- | --- | --- | --- | --- | --- |\n" + trows + "\n\n")
+    return f"""# 代码审核报告
+
+## 本次审核要求
+无，按标准审核流程执行。
+
+## 总体评价
+这是一个订单服务的示例工程，技术栈 Python + sqlite3，代码规模约 120 行。
+整体质量评分：78 分。评分依据：入口缺少统一校验，SQL 全部为字符串拼接，
+缓存没有失效机制；但模块划分清楚、命名直白。
+
+{track}## 问题清单
+
+| 编号 | 级别 | 文件:行号 | 问题描述 | 成因 | 后果 | 修改建议 |
+| --- | --- | --- | --- | --- | --- | --- |
+{rows}
+
+## 严重与高危问题详述
+
+```python
+cur.execute("SELECT * FROM orders WHERE id = " + str(order_id))
+```
+
+同一段判断在入口和 DAO 各写了一份，改一处会漏另一处；一旦有人只改一边，
+未改的那条路径就会绕过校验。
+
+## 安全性专项检查
+命令注入未发现；SQL 注入存在 2 处；路径穿越未发现；硬编码密钥未发现；
+敏感信息泄漏未发现；不安全反序列化未发现；依赖风险未评估；日志泄漏未发现；
+并发与竞态存在（缓存无锁）；资源耗尽存在（缓存无上限）。
+
+## 架构与可维护性
+模块划分为 main / store / api 三层，但数据访问与业务判断混在同一函数里；
+错误处理基本没有；类型标注缺失；命名尚可。
+
+## 测试与工程化
+没有测试用例，没有 CI 配置，依赖清单缺失；建议先补 3 个入口校验的回归用例。
+
+## 结论与放行建议
+修改后放行。必须先处理 SQL 字符串拼接（2 处）与缓存过期策略。
+"""
+
+
+CHUNK_TEXT = """### 一、本批问题清单
+
+| 编号 | 级别 | 文件:行号 | 问题描述 | 成因 | 后果 | 修改建议 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 高危 | app/main.py:10 | 本批 SQL 拼接 | 直接拼参数 | 可读全库 | 参数化 |
+
+### 二、严重与高危问题的代码片段
+见问题清单。
+"""
+
+
+class FakeProvider:
+    """按提示词类型返回不同内容；可配置失败次数"""
+
+    def __init__(self, fail_first=0, delay=0.0):
+        self.configured = True
+        self.model = "fake-model"
+        self.has_key = True
+        self.protocol = "openai"
+        self.fail_left = fail_first
+        self.delay = delay
+        self.tracking = None
+        self.prompts = []
+        self.lock = threading.Lock()
+
+    def describe(self):
+        return "fake://model"
+
+    def chat(self, messages, model="", max_tokens=0):
+        prompt = messages[-1]["content"] if messages else ""
+        with self.lock:
+            self.prompts.append(prompt)
+            if self.fail_left > 0:
+                self.fail_left -= 1
+                raise B.LLM.LLMError("HTTP 401 无效的 API Key")
+        if self.delay:
+            time.sleep(self.delay)
+        if "未通过结构校验" in prompt:
+            text = report_text(self.tracking)
+        elif "分批代码审核的第" in prompt:
+            text = CHUNK_TEXT
+        elif "总审" in prompt or "合并成" in prompt:
+            text = report_text(self.tracking)
+        else:
+            text = report_text(self.tracking)
+        return types.SimpleNamespace(text=text, elapsed=0.01, finish_reason="stop",
+                                     truncated=False)
+
+
+# ---------------------------------------------------------------- 本地直链服务
+class UrlServer:
+    def __init__(self, blobs: dict):
+        self.blobs = blobs          # path -> (bytes, headers) or ("login", None)
+        outer = self
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                p = urllib.parse.urlparse(self.path).path
+                spec = outer.blobs.get(p)
+                if spec is None:
+                    self.send_response(404)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                kind, body = spec
+                if kind == "login":
+                    if "MAIL5K=" not in (self.headers.get("Cookie") or ""):
+                        self.send_response(400)
+                        self.send_header("X-Error-Message", "Need MAIL5K= in Cookie")
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                        return
+                    body = outer.blobs["/zip"][1]
+                self.send_response(200)
+                self.send_header("Content-Type", "application/zip")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        self.srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def url(self, path):
+        return f"http://127.0.0.1:{self.srv.server_address[1]}{path}"
+
+    def close(self):
+        self.srv.shutdown()
+
+
+# ---------------------------------------------------------------- harness
+class Env:
+    def __init__(self, cfg: dict = None, provider: FakeProvider = None):
+        # 必须放在 BASE 之下：do_reply 会算附件的相对路径（./work/...）
+        root = BASE / ".e2e_tmp"
+        root.mkdir(exist_ok=True)
+        self.tmp = Path(tempfile.mkdtemp(prefix="run_", dir=str(root)))
+        self.saved = {}
+        for name, val in (("WORK", self.tmp / "work"), ("TASKS", self.tmp / "tasks"),
+                          ("LOCKS", self.tmp / "lock"), ("LOGS", self.tmp / "logs"),
+                          ("REPORTS", self.tmp / "reports")):
+            if hasattr(B, name):
+                self.saved[name] = getattr(B, name)
+                setattr(B, name, val)
+            val.mkdir(parents=True, exist_ok=True)
+
+        self.base_cfg = dict(B.CONFIG)
+        self.cfg = dict(self.base_cfg)
+        self.cfg.update({"llm_backend": "http", "require_approval": False,
+                         "ack_enabled": True, "retry_backoff_sec": 60,
+                         "max_retries": 3, "max_review_files": 200,
+                         "review_chunk_files": 40, "chunk_workers": 1,
+                         "llm_max_concurrency": 2, "max_file_chars": 10000})
+        self.cfg.update(cfg or {})
+        self.saved["_load_config"] = B._load_config
+        B._load_config = lambda: dict(self.cfg)
+        B.CONFIG = dict(self.cfg)
+        B._GATE = None
+
+        self.provider = provider or FakeProvider()
+        self.saved["Provider"] = B.LLM.Provider
+        B.LLM.Provider = lambda cfg=None: self.provider
+
+        self.saved["run_cli"] = B.run_cli
+        B.run_cli = self._fake_cli
+
+        self.saved["log"] = B.log
+        self.logs = []
+        B.log = lambda msg, level="INFO": self.logs.append(f"[{level}] {msg}")
+
+        self.msgs = {}
+        self.blobs = {}
+        self.names = {}
+        self.replies = {}
+
+    # ---- 假 CLI ----
+    def _fake_cli(self, args, timeout=240, _retry=True):
+        a = [str(x) for x in args]
+        if a[:2] != ["message", "+read"] and a[:2] != ["attachment", "+download"] \
+                and a[:2] != ["message", "+reply"]:
+            raise AssertionError(f"未预期的 CLI 调用: {a}")
+        if a[:2] == ["message", "+read"]:
+            mid = a[a.index("--id") + 1]
+            m = self.msgs.get(mid)
+            if m is None:
+                raise B.CliError("邮件不存在")
+            return {"message_id": mid, "subject": m["subject"], "body": m.get("body", ""),
+                    "attachments": m["attachments"],
+                    "from": {"email": "sender@example.com", "name": "发件人"}}
+        if a[:2] == ["attachment", "+download"]:
+            mid = a[a.index("--msg") + 1]
+            aid = a[a.index("--att") + 1]
+            dl = B.WORK / mid / "downloads"
+            dl.mkdir(parents=True, exist_ok=True)
+            p = dl / (self.names.get(aid) or f"{aid}.zip")
+            p.write_bytes(self.blobs[aid])
+            return {"saved_to": str(p)}
+        mid = a[a.index("--id") + 1]
+        body = a[a.index("--body") + 1]
+        files = [a[i + 1] for i, x in enumerate(a) if x == "--attachment"]
+        self.replies.setdefault(mid, []).append({"body": body, "files": files})
+        return {"ok": True}
+
+    # ---- 造数据 ----
+    def add_task(self, mid, subject, zip_files=None, att=None, url=None, size=None):
+        """att: 普通附件（有 attachment_id）；url: 超大附件（只有 download_url）"""
+        if zip_files is not None:
+            aid = f"att_{mid[-6:]}"
+            self.blobs[aid] = make_zip(zip_files)
+            self.names[aid] = "code.zip"
+            att = {"attachment_id": aid, "filename": "code.zip",
+                   "size": size or len(self.blobs[aid])}
+        attachments = []
+        if att:
+            attachments.append(att)
+        if url:
+            attachments.append({"filename": "big.zip",
+                                "size": size or 123456, "download_url": url})
+        self.msgs[mid] = {"subject": subject, "attachments": attachments}
+        B.save_task({"message_id": mid, "subject": subject, "state": "SEEN",
+                     "created_at_ts": time.time(), "attempts": 0, "next_retry_at": 0,
+                     "from": "sender@example.com", "from_name": "发件人"})
+        return B.load_task(mid)
+
+    def run(self, mid):
+        return B.process_task(mid)
+
+    def body(self, mid):
+        rs = self.replies.get(mid) or []
+        return rs[-1]["body"] if rs else ""
+
+    def files(self, mid):
+        rs = self.replies.get(mid) or []
+        return rs[-1]["files"] if rs else []
+
+    def close(self):
+        B.run_cli = self.saved["run_cli"]
+        B.log = self.saved["log"]
+        B.LLM.Provider = self.saved["Provider"]
+        B._load_config = self.saved["_load_config"]
+        for k, v in self.saved.items():
+            if k in ("run_cli", "log", "Provider", "_load_config"):
+                continue
+            setattr(B, k, v)
+        B.CONFIG = self.base_cfg
+        B._GATE = None
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+
+SMALL = {"app/main.py": "def f():\n    return 1\n",
+         "app/store.py": "def g():\n    return 2\n",
+         "app/api.py": "def h():\n    return 3\n"}
+
+
+def main():
+    # ================= S1 正常单包 =================
+    env = Env()
+    try:
+        t = env.add_task("msg_s1", "代码审核 - demo 订单服务", SMALL)
+        r = env.run("msg_s1")
+        t = B.load_task("msg_s1")
+        check("S1 走完 -> REPLIED", r == "REPLIED" and t["state"] == "REPLIED", r)
+        rpt = Path(t["report"])
+        check("S1 产出 Markdown 报告", (rpt / "代码审核报告.md").is_file())
+        check("S1 产出 HTML 报告", (rpt / "代码审核报告.html").is_file())
+        check("S1 产出摘要", (rpt / "summary.md").is_file())
+        check("S1 报告结构合规（无修复重跑）",
+              not any("未通过结构校验" in p for p in env.provider.prompts),
+              f"{len(env.provider.prompts)} 次调用")
+        check("S1 回信带两个附件", len(env.files("msg_s1")) == 2, str(env.files("msg_s1")))
+        check("S1 回信含审核摘要", "审核摘要" in env.body("msg_s1"))
+        check("S1 统计到 3 条问题", t.get("new_issues") == 3, str(t.get("new_issues")))
+        check("S1 没有上一轮基线", not t.get("baseline_mid"))
+    finally:
+        env.close()
+
+    # ================= S2 大包分批 + 无基线（A 回归）=================
+    env = Env({"review_chunk_files": 10})
+    try:
+        big = {f"pkg/m{i:02d}.py": f"def f{i}():\n    return {i}\n" for i in range(45)}
+        env.add_task("msg_s2", "代码审核 - big 项目", big)
+        r = env.run("msg_s2")
+        t = B.load_task("msg_s2")
+        rpt = Path(t["report"])
+        check("S2 分批审核不崩（A 的 IndexError 回归）", r == "REPLIED", r)
+        chunks = sorted(rpt.glob("chunk_*_报告.md"))
+        check("S2 真的分了 5 批", len(chunks) == 5, f"{len(chunks)} 批")
+        check("S2 有最终报告", (rpt / "代码审核报告.md").is_file())
+        check("S2 无基线时不要求跟踪表",
+              "上轮问题跟踪" not in (rpt / "代码审核报告.md").read_text(encoding="utf-8"))
+        check("S2 回信正常", "审核摘要" in env.body("msg_s2"))
+    finally:
+        env.close()
+
+    # ================= S3 第 2 轮闭环（A 端到端）=================
+    env = Env()
+    try:
+        env.add_task("msg_s3a", "代码审核 - cycle 项目", SMALL)
+        env.run("msg_s3a")
+        env.provider.tracking = [
+            ("严重", "app/main.py:10", "SQL 字符串拼接", "已修复"),
+            ("高危", "app/store.py:8", "缓存无过期", "未修复"),
+            ("中危", "app/api.py:22", "无入参校验", "部分修复"),
+        ]
+        env.add_task("msg_s3b", "代码审核 - cycle 项目（第2轮）", SMALL)
+        r = env.run("msg_s3b")
+        t = B.load_task("msg_s3b")
+        check("S3 第 2 轮走通", r == "REPLIED", r)
+        check("S3 认出上一轮基线", t.get("baseline_mid") == "msg_s3a",
+              str(t.get("baseline_mid")))
+        check("S3 轮次记为第 2 轮", t.get("review_round") == 2, str(t.get("review_round")))
+        tr = t.get("tracking") or {}
+        check("S3 闭环统计正确", (tr.get("total"), tr.get("fixed"), tr.get("unfixed"),
+                                  tr.get("partial")) == (3, 1, 1, 1), str(tr))
+        body = env.body("msg_s3b")
+        check("S3 回信含闭环摘要", "上轮问题跟踪" in body and "已修复 1" in body, body[-300:])
+        check("S3 回信列出未修完的项", "缓存无过期" in body, body[-300:])
+        md = (Path(t["report"]) / "代码审核报告.md").read_text(encoding="utf-8")
+        check("S3 报告含跟踪表", "上轮问题跟踪" in md and "本轮判定" in md)
+    finally:
+        env.close()
+
+    # ================= S4 直链需要登录态（B 回归）=================
+    srv = UrlServer({"/login": ("login", b"")})
+    env = Env()
+    try:
+        t = env.add_task("msg_s4", "代码审核 - 超大附件", url=srv.url("/login"), size=371907)
+        r = env.run("msg_s4")
+        t = B.load_task("msg_s4")
+        body = env.body("msg_s4")
+        check("S4 直链取不回时仍然回信（不崩）", r == "REPLIED_LINK_ONLY", r)
+        check("S4 错误里写清了登录态", "登录态" in (t.get("last_error") or ""),
+              str(t.get("last_error"))[:120])
+        check("S4 回信解释「超大附件」", "超大附件" in body)
+        check("S4 回信给 3 种替代办法", "换成普通附件重发" in body)
+        check("S4 不给发件人看服务端英文报错", "MAIL5K" not in body)
+        check("S4 没有误报 20MB", "20MB 上限" not in body)
+    finally:
+        env.close()
+
+    # ================= S5 直链 + Cookie 能取回（B 功能）=================
+    srv5 = UrlServer({"/login": ("login", b""), "/zip": ("zip", make_zip(SMALL))})
+    env = Env({"download_cookie": "MAIL5K=test-cookie"})
+    try:
+        env.add_task("msg_s5", "代码审核 - 直链可取", url=srv5.url("/login"), size=2048)
+        r = env.run("msg_s5")
+        t = B.load_task("msg_s5")
+        check("S5 带 Cookie 的直链能下载并审核", r == "REPLIED", r)
+        check("S5 报告已产出",
+              (Path(t["report"]) / "代码审核报告.md").is_file())
+        check("S5 日志里有直链下载成功", any("直链下载成功" in x for x in env.logs),
+              str([x for x in env.logs if "直链" in x][:2]))
+    finally:
+        env.close()
+
+    # ================= S6 模型失败 -> FAILED + 退避（C 回归）=================
+    env = Env(provider=FakeProvider(fail_first=99))
+    try:
+        env.add_task("msg_s6", "代码审核 - 模型挂了", SMALL)
+        cand = B.load_task("msg_s6")
+        B.process_candidate(cand)
+        t = B.load_task("msg_s6")
+        check("S6 模型失败 -> FAILED", t["state"] == "FAILED", str(t["state"]))
+        check("S6 记录了错误", "401" in (t.get("last_error") or ""), str(t.get("last_error")))
+        check("S6 设置了退避时间", (t.get("next_retry_at") or 0) > time.time())
+        check("S6 未到重试上限时不发失败通知", not env.replies.get("msg_s6"))
+    finally:
+        env.close()
+
+    # ================= S7 两个任务并发（C 端到端）=================
+    env = Env()
+    try:
+        env.provider.delay = 0.05
+        env.add_task("msg_s7a", "代码审核 - 并发A", SMALL)
+        env.add_task("msg_s7b", "代码审核 - 并发B", SMALL)
+        out = {}
+
+        def go(mid):
+            out[mid] = B.process_task(mid)
+
+        ths = [threading.Thread(target=go, args=(m,)) for m in ("msg_s7a", "msg_s7b")]
+        for th in ths:
+            th.start()
+        for th in ths:
+            th.join()
+        ta, tb = B.load_task("msg_s7a"), B.load_task("msg_s7b")
+        check("S7 两个任务都完成", out.get("msg_s7a") == "REPLIED"
+              and out.get("msg_s7b") == "REPLIED", str(out))
+        check("S7 各自都有报告",
+              (Path(ta["report"]) / "代码审核报告.md").is_file()
+              and (Path(tb["report"]) / "代码审核报告.md").is_file())
+        check("S7 各回一封信", len(env.replies.get("msg_s7a", [])) == 1
+              and len(env.replies.get("msg_s7b", [])) == 1)
+        check("S7 报告内容各自独立（没有写串）",
+              "订单服务" in (Path(ta["report"]) / "代码审核报告.md").read_text(encoding="utf-8"))
+        check("S7 没有残留任务临时文件", not list(B.TASKS.glob("*.tmp")))
+    finally:
+        env.close()
+
+    # ================= S8 处理期间发确认信（C2 端到端）=================
+    env = Env({"ack_timeout_sec": 0})
+    try:
+        env.add_task("msg_s8", "代码审核 - 确认信并发", SMALL)
+        t0 = B.load_task("msg_s8")
+        t0["created_at_ts"] = time.time() - 999
+        B.save_task(t0)
+        env.provider.delay = 0.3          # 让审核期间足够长
+
+        res = {}
+
+        def go():
+            res["r"] = B.process_task("msg_s8")
+
+        th = threading.Thread(target=go)
+        th.start()
+        time.sleep(0.15)
+        B.ack_sweep()                     # 处理中发确认信
+        th.join()
+        t = B.load_task("msg_s8")
+        check("S8 确认信没有把任务拉回 SEEN", t["state"] == "REPLIED", str(t["state"]))
+        check("S8 确认信标记被保留", bool(t.get("ack_sent_at")))
+        check("S8 正常发了报告回信", res.get("r") == "REPLIED" and env.replies.get("msg_s8"),
+              str(res))
+    finally:
+        env.close()
+
+    srv.close()
+    srv5.close()
+    print(f"\n{PASS}/{PASS + FAIL} 通过")
+    return 0 if FAIL == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

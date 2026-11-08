@@ -628,6 +628,26 @@ def save_task(task: dict) -> None:
         tmp.unlink(missing_ok=True)      # 写失败时不留垃圾临时文件
 
 
+# 由「旁路写者」（确认信 / 审批）维护的字段。
+# 主流程 process_task 会在开头 load 一份快照、几十分钟后才写回，
+# 期间旁路写进去的字段会被旧快照覆盖 —— 所以主流程落盘前要先并一次。
+EXTERNAL_FIELDS = ("ack_sent_at", "approved_at", "approved_by")
+
+
+def save_flow(task: dict) -> dict:
+    """主流程落盘：先把旁路写者刚写的字段并进来，再写
+
+    只用于 process_task 这种「长事务」；其它短事务直接用 save_task/update_task。
+    """
+    disk = load_task(task["message_id"])
+    if disk:
+        for k in EXTERNAL_FIELDS:
+            if k in disk and k not in task:
+                task[k] = disk[k]
+    save_task(task)
+    return task
+
+
 def update_task(mid: str, mutate) -> dict:
     """字段级更新：只把 mutate 改过的字段叠到**磁盘最新副本**上
 
@@ -2521,7 +2541,7 @@ def process_task(mid: str) -> str:
             return "SKIP_REPLIED"
 
         t["attempts"] = t.get("attempts", 0) + 1
-        save_task(t)
+        save_flow(t)
         wdir = WORK / mid
         dl = wdir / "downloads"
         src = wdir / "src"
@@ -2622,8 +2642,9 @@ def process_task(mid: str) -> str:
             t["state"] = "REPLIED"
             t["replied_at"] = iso()
             t["last_error"] = "附件仅提供直链且无法取回: " + "; ".join(
-                f"{n}({ANOMALY.human_size(s)})" for n, s, _ in link_only)
-            save_task(t)
+                f"{n}({ANOMALY.human_size(s)})：{e or '未知原因'}"
+                for n, s, e in link_only)
+            save_flow(t)
             return "REPLIED_LINK_ONLY"
         if not saved and dl_failed:
             body = ANOMALY.reply_download_failed(subj, dl_failed)
@@ -2631,18 +2652,18 @@ def process_task(mid: str) -> str:
             t["state"] = "REPLIED"
             t["replied_at"] = iso()
             t["last_error"] = "附件下载失败: " + "; ".join(f"{n}: {e}" for n, e in dl_failed)
-            save_task(t)
+            save_flow(t)
             return "REPLIED_DOWNLOAD_FAILED"
         if not saved:
             body = ANOMALY.reply_no_attachment(subj)
             do_reply(mid, body, [])
             t["state"] = "REPLIED"
             t["replied_at"] = iso()
-            save_task(t)
+            save_flow(t)
             return "REPLIED_NO_ATTACH"
 
         t["state"] = "DOWNLOADED"
-        save_task(t)
+        save_flow(t)
 
         # 5. AI 审核
         mail_body = str(msg.get("body") or "")
@@ -2664,7 +2685,7 @@ def process_task(mid: str) -> str:
         else:
             t.setdefault("review_round", round_of(t.get("subject", "")) or 1)
         t.setdefault("project_key", project_key(t.get("subject", "")))
-        save_task(t)
+        save_flow(t)
         files = collect_source_files(src, CONFIG["max_review_files"])
         if not files:
             if extract_errors:
@@ -2676,19 +2697,19 @@ def process_task(mid: str) -> str:
             do_reply(mid, body, [])
             t["state"] = "REPLIED"
             t["replied_at"] = iso()
-            save_task(t)
+            save_flow(t)
             return "REPLIED_NO_SOURCE"
 
         rpt = run_review(t, extra, baseline)
         t["state"] = "REVIEWED"
         t["report"] = str(rpt)
-        save_task(t)
+        save_flow(t)
 
         # 6. 审批闸：开了审批就停下等人批，不自动发
         if require_approval():
             t["state"] = "AWAITING_APPROVAL"
             t["awaiting_since"] = iso()
-            save_task(t)
+            save_flow(t)
             log(f"[{mid}] 审核完成，等待人工审批（require_approval 已开启）")
             return "AWAITING_APPROVAL"
 
@@ -2697,7 +2718,7 @@ def process_task(mid: str) -> str:
         t["state"] = "REPLIED"
         t["replied_at"] = iso()
         t["last_error"] = None
-        save_task(t)
+        save_flow(t)
         return "REPLIED"
 
 
