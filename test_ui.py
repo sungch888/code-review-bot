@@ -292,6 +292,12 @@ def main():
             check("控制台改用可暂停的 JS 刷新", "REFRESH_SEC = 20" in body and "formBusy" in body,
                   body[-250:])
             check("控制台会提示「正在输入，自动刷新已暂停」", "自动刷新已暂停" in body)
+            # 暂停必须有上限，否则用户改了字段未提交时页面永远不刷新（“卡住”）
+            check("自动刷新暂停有上限（不会永久卡住）",
+                  re.search(r"MAX_PAUSE_SEC\s*=\s*\d+", body) is not None
+                  and "MAX_PAUSE_SEC" in body.split("function refreshTick")[1][:800],
+                  body[-400:])
+            check("暂停时提供「立即刷新」出口", "立即刷新" in body)
             check("控制台改用模型入口(不再放完整配置卡片)",
                   'href="/model"' in body and 'id="provform"' not in body)
 

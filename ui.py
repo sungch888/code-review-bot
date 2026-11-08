@@ -229,8 +229,11 @@ def esc(s) -> str:
 
 
 # 自动刷新：只要页面上有表单正在输入/被修改，就暂停刷新（否则会把输到一半的内容冲掉）
+# 但暂停必须有上限：否则用户改了某个字段又没提交，页面会永远不再刷新（看起来“卡住”）。
 REFRESH_JS = """
 var INIT_VALUES = new Map();
+var PAUSED_SINCE = 0;          // 首次进入“暂停”的时间戳（ms），0=未暂停
+var MAX_PAUSE_SEC = 300;       // 最长暂停 5 分钟，超过就恢复刷新（防永久卡住）
 function rememberInit(){
   document.querySelectorAll('form input, form textarea, form select').forEach(function(el){
     INIT_VALUES.set(el, el.value);
@@ -246,13 +249,30 @@ function formBusy(){
   }
   return false;
 }
-function showPaused(on){
+function showPaused(on, text){
   var p = document.getElementById('paused');
-  if (p) p.style.display = on ? 'inline' : 'none';
+  if (!p) return;
+  p.style.display = on ? 'inline' : 'none';
+  if (on && text) p.textContent = text;
 }
 function refreshTick(){
   if (!REFRESH_SEC) return;
-  if (formBusy()) { showPaused(true); setTimeout(refreshTick, 4000); return; }
+  if (formBusy()) {
+    if (!PAUSED_SINCE) PAUSED_SINCE = Date.now();
+    var secs = Math.floor((Date.now() - PAUSED_SINCE) / 1000);
+    if (secs >= MAX_PAUSE_SEC) {
+      // 暂停太久：恢复刷新，避免页面永久“卡住”（未提交的修改会丢，这是可接受的取舍）
+      showPaused(false);
+      location.reload();
+      return;
+    }
+    showPaused(true, '正在输入，自动刷新已暂停（' + secs
+      + ' 秒；满 ' + MAX_PAUSE_SEC + ' 秒恢复）。改完点保存，或'
+      + ' <a href="javascript:location.reload()">立即刷新</a>');
+    setTimeout(refreshTick, 4000);
+    return;
+  }
+  PAUSED_SINCE = 0;
   showPaused(false);
   location.reload();
 }
