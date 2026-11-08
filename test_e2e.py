@@ -27,6 +27,7 @@ harness 提供：
 """
 import http.server
 import io
+import os
 import sys
 import tempfile
 import threading
@@ -225,7 +226,8 @@ class Env:
         self.saved = {}
         for name, val in (("WORK", self.tmp / "work"), ("TASKS", self.tmp / "tasks"),
                           ("LOCKS", self.tmp / "lock"), ("LOGS", self.tmp / "logs"),
-                          ("REPORTS", self.tmp / "reports")):
+                          ("REPORTS", self.tmp / "reports"),
+                          ("ACKS", self.tmp / "ack")):
             if hasattr(B, name):
                 self.saved[name] = getattr(B, name)
                 setattr(B, name, val)
@@ -247,6 +249,9 @@ class Env:
         self.provider = provider or FakeProvider()
         self.saved["Provider"] = B.LLM.Provider
         B.LLM.Provider = lambda cfg=None: self.provider
+
+        self.saved["PI"] = B.PI
+        B.PI = [sys.executable, str(BASE / "testdata" / "pi_stub.py")]
 
         self.saved["run_cli"] = B.run_cli
         B.run_cli = self._fake_cli
@@ -321,12 +326,13 @@ class Env:
         return rs[-1]["files"] if rs else []
 
     def close(self):
+        B.PI = self.saved["PI"]
         B.run_cli = self.saved["run_cli"]
         B.log = self.saved["log"]
         B.LLM.Provider = self.saved["Provider"]
         B._load_config = self.saved["_load_config"]
         for k, v in self.saved.items():
-            if k in ("run_cli", "log", "Provider", "_load_config"):
+            if k in ("run_cli", "log", "Provider", "_load_config", "PI"):
                 continue
             setattr(B, k, v)
         B.CONFIG = self.base_cfg
@@ -506,10 +512,53 @@ def main():
         th.join()
         t = B.load_task("msg_s8")
         check("S8 确认信没有把任务拉回 SEEN", t["state"] == "REPLIED", str(t["state"]))
-        check("S8 确认信标记被保留", bool(t.get("ack_sent_at")))
+        check("S8 确认信标记进台账且保留", bool(B.ack_sent_at("msg_s8")))
         check("S8 正常发了报告回信", res.get("r") == "REPLIED" and env.replies.get("msg_s8"),
               str(res))
     finally:
+        env.close()
+
+    # ================= S9 pi 后端全链路（合并流水线后仍要能跑）=================
+    env = Env({"llm_backend": "pi", "pi_model": "",
+               "review_chunk_files": 10})
+    try:
+        txt = env.tmp / "pi_report.md"
+        txt.write_text(report_text(), encoding="utf-8")
+        os.environ["PI_STUB_TEXT"] = str(txt)
+        big = {f"pkg/m{i:02d}.py": f"def f{i}():\n    return {i}\n" for i in range(25)}
+        env.add_task("msg_s9", "代码审核 - pi 后端", big)
+        r = env.run("msg_s9")
+        t = B.load_task("msg_s9")
+        rpt = Path(t["report"])
+        check("S9 pi 后端走完 -> REPLIED", r == "REPLIED", r)
+        check("S9 pi 后端也分了 3 批", len(list(rpt.glob("chunk_*_报告.md"))) == 3,
+              str(len(list(rpt.glob("chunk_*_报告.md")))))
+        md = rpt / "代码审核报告.md"
+        check("S9 pi 后端产出最终报告", md.is_file() and md.stat().st_size > 500)
+        check("S9 pi 后端写了 .pi.log 原始输出", (B.LOGS / "msg_s9.pi.log").is_file())
+        check("S9 pi 后端报告同样经过来源擦除/校验",
+              not any("Brooks" in md.read_text(encoding="utf-8") for _ in [0]))
+        check("S9 回信正常", "审核摘要" in env.body("msg_s9"))
+    finally:
+        os.environ.pop("PI_STUB_TEXT", None)
+        env.close()
+
+    # ================= S10 pi 后端上游繁忙（503）===============
+    env = Env({"llm_backend": "pi", "fallback_model": ""})
+    try:
+        os.environ["PI_STUB_MODE"] = "busy"
+        env.add_task("msg_s10", "代码审核 - pi 繁忙", SMALL)
+        cand = B.load_task("msg_s10")
+        B.process_candidate(cand)
+        t = B.load_task("msg_s10")
+        check("S10 pi 繁忙 -> FAILED（不静默）", t["state"] == "FAILED", str(t["state"]))
+        check("S10 错误说明是上游过载", "繁忙" in (t.get("last_error") or ""),
+              str(t.get("last_error"))[:120])
+        check("S10 已按提供商繁忙拉长退避",
+              (t.get("next_retry_at") or 0) > time.time() + 100,
+              str((t.get("next_retry_at") or 0) - time.time()))
+    finally:
+        os.environ.pop("PI_STUB_MODE", None)
         env.close()
 
     srv.close()

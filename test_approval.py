@@ -29,10 +29,12 @@ def check(name, cond, detail=""):
 
 # ---------- 用一个隔离目录，别污染真实 state/work ----------
 TMP = Path(tempfile.mkdtemp(prefix="appr_test_"))
-OLD_TASKS, OLD_WORK = B.TASKS, B.WORK
+OLD_TASKS, OLD_WORK, OLD_ACKS = B.TASKS, B.WORK, B.ACKS
 B.TASKS = TMP / "tasks"
 B.WORK = TMP / "work"
+B.ACKS = TMP / "ack"
 B.TASKS.mkdir(parents=True)
+B.ACKS.mkdir(parents=True)
 
 # 记录器：替代真实发送
 SENT = []
@@ -59,6 +61,8 @@ def mk_task(state, created_ago=0, **kw):
     }
     t.update(kw)
     B.save_task(t)
+    # 每个场景都是「一个新任务」：确认信台账也要清，否则会被上一个场景的标记挡住
+    B.ack_path(MID).unlink(missing_ok=True)
     return t
 
 
@@ -135,7 +139,7 @@ try:
     n = B.ack_sweep()
     check("超时任务发确认信", n == 1 and len(SENT) == 1, f"n={n} sent={len(SENT)}")
     t = B.load_task(MID)
-    check("记录 ack_sent_at", bool(t.get("ack_sent_at")), str(t.get("ack_sent_at")))
+    check("记录 ack_sent_at", bool(B.ack_sent_at(MID)), str(B.ack_sent_at(MID)))
     check("确认信文案含「已收到」", "已收到" in SENT[0]["body"], SENT[0]["body"][:80])
 
     # 5.3 已经发过不再重复发
@@ -198,7 +202,7 @@ try:
           "if require_approval():" in seg, "")
 
 finally:
-    B.TASKS, B.WORK = OLD_TASKS, OLD_WORK
+    B.TASKS, B.WORK, B.ACKS = OLD_TASKS, OLD_WORK, OLD_ACKS
     shutil.rmtree(TMP, ignore_errors=True)
 
 print(f"\n{sum(results)}/{len(results)} 通过")

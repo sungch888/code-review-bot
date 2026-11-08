@@ -761,9 +761,10 @@ def page_task(mid: str, flash: str = "", err: bool = False) -> str:
 </div>"""
 
     ack_line = ""
-    if t.get("ack_sent_at"):
+    _ack = B.ack_sent_at(mid)
+    if _ack:
         ack_line = (f'<div class="k">处理中确认信</div>'
-                    f'<div>已于 {fmt_time(t.get("ack_sent_at"))} 发送</div>')
+                    f'<div>已于 {fmt_time(_ack)} 发送</div>')
 
     body = f"""
 {approval_panel}

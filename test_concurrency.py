@@ -46,8 +46,10 @@ def check(name, cond, extra=""):
 TMP = Path(tempfile.mkdtemp(prefix="conc_"))
 B.TASKS = TMP / "tasks"
 B.WORK = TMP / "work"
+B.ACKS = TMP / "ack"          # 确认信台账也要隔离，否则会写进真实 state/ack
 B.TASKS.mkdir(parents=True, exist_ok=True)
 B.WORK.mkdir(parents=True, exist_ok=True)
+B.ACKS.mkdir(parents=True, exist_ok=True)
 
 
 def mk(mid, state="SEEN", ts=100, **kw):
@@ -407,7 +409,8 @@ def main():
         check("确认信不会把状态回写成 SEEN", after["state"] == "DOWNLOADED",
               str(after["state"]))
         check("确认信不会抹掉重试次数", after["attempts"] == 3, str(after["attempts"]))
-        check("确认信标记确实写进去了", bool(after.get("ack_sent_at")))
+        check("确认信标记写进独立台账", bool(B.ack_sent_at(mid_ack)))
+        check("台账不污染任务文件", "ack_sent_at" not in after)
         check("确认信不改其他字段", after["subject"] == "代码审核 - x")
 
         # ---------- G. 配置默认值 ----------

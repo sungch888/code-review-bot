@@ -56,7 +56,7 @@ rc |= run([sys.executable, "test_no_window.py"], "14. 黑窗防护（CREATE_NO_W
 rc |= run([sys.executable, "test_regression.py"], "15. 多轮闭环审核（回归核对）")
 rc |= run([sys.executable, "test_download.py"], "16. 超大附件直链取回")
 rc |= run([sys.executable, "test_concurrency.py"], "17. 并发与限流冷却")
-rc |= run([sys.executable, "test_e2e.py"], "18. 端到端（假邮件 + 假模型，八个场景）")
+rc |= run([sys.executable, "test_e2e.py"], "18. 端到端（假邮件 + 假模型 + 假 pi，十个场景）")
 
 print("\n" + "=" * 40)
 print("全部通过" if rc == 0 else "存在失败项")
