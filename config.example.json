@@ -91,5 +91,7 @@
   "ack_enabled": true,
   "ack_timeout_sec": 300,
   "regression_review": true,
-  "regression_max_issues": 80
+  "regression_max_issues": 80,
+  "download_cookie": "",
+  "download_cookie_file": ""
 }

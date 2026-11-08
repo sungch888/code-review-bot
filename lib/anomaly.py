@@ -9,6 +9,8 @@
 2. **每封异常回信都要可操作**：说清「发生了什么 / 为什么 / 你现在该做什么」，
    给出具体步骤，而不是只说"处理失败"。
 """
+import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -39,21 +41,71 @@ def human_size(n: int) -> str:
 
 
 def download_via_url(url: str, dest: Path, max_bytes: int = MAIL_LIMIT * 3,
-                     timeout: int = 120):
-    """尝试直接下载 download_url 形式的附件。
+                     timeout: int = 120, cookie: str = "", retries: int = 3):
+    """尝试直接下载 download_url 形式的附件（超大附件直链）。
 
-    注意：QQ 邮箱的 ftn 下载域名需要会话鉴权，匿名请求通常返回 400，
-    所以这里**尽力而为**，失败就如实上报，不做任何假设。
+    真实踩过的坑：QQ 邮箱的超大附件直链 302 到 CDN 后，如果没带
+    `MAIL5K` 会话 Cookie，CDN 会返回 `400 X-Error-Message: Need MAIL5K= in Cookie`。
+    所以：
+      - 支持传入 Cookie（config.json 的 download_cookie / download_cookie_file）
+      - 把 CDN 的 X-Error-Message 翻成人话，不要只说「HTTP 400」
+      - 只对瞬时故障重试，4xx 不重试（省一次无辜的等待）
+      - 校验下载到的东西真的是压缩包（防止存下一个错误页/网关提示）
 
     返回 (ok: bool, path: Path|None, err: str)
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
+    last = "下载失败"
+    for attempt in range(1, max(1, retries) + 1):
+        ok, path, err, permanent = _download_once(url, dest, max_bytes, timeout, cookie)
+        if ok:
+            return True, path, ""
+        last = err
+        if permanent or attempt >= retries:
+            break
+        # 瞬时故障（5xx / 超时 / 连接重置）才退避重试
+        time.sleep(min(2 * attempt, 6))
+    return False, None, last
+
+
+_TRANSIENT_HTTP = {408, 425, 429, 500, 502, 503, 504}
+_MAGIC = {
+    ".zip": (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"),
+    ".gz": (b"\x1f\x8b",), ".tgz": (b"\x1f\x8b",),
+    ".bz2": (b"BZh",), ".xz": (b"\xfd7zXZ",),
+    ".7z": (b"7z\xbc\xaf\x27\x1c",), ".rar": (b"Rar!",),
+}
+
+
+def cookie_header(cookie: str) -> str:
+    """把用户给的 Cookie 规整成请求头：只给值就补成 MAIL5K=值"""
+    c = (cookie or "").strip().strip(";")
+    if not c:
+        return ""
+    first = c.split(";")[0]
+    if "=" not in first:
+        return f"MAIL5K={c}"
+    return c
+
+
+def needs_login(err: str) -> bool:
+    """失败原因是不是「需要邮箱网页登录态」（超大附件直链的典型）"""
+    s = (err or "").lower()
+    return any(k in s for k in ("mail5k", "登录态", "need login", "cookie"))
+
+
+def _download_once(url, dest: Path, max_bytes: int, timeout: int, cookie: str):
+    """一次下载尝试 -> (ok, path, err, permanent)"""
+    headers = dict(HEADERS)
+    ck = cookie_header(cookie)
+    if ck:
+        headers["Cookie"] = ck
     try:
-        req = urllib.request.Request(url, headers=HEADERS)
+        req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=timeout) as r:
             ctype = (r.headers.get("Content-Type") or "").lower()
             if "text/html" in ctype:
-                return False, None, f"链接返回的是 HTML 页面（{ctype}），不是文件"
+                return False, None, f"链接返回的是 HTML 页面（{ctype}），不是文件", True
             total = 0
             with open(dest, "wb") as f:
                 while True:
@@ -64,16 +116,60 @@ def download_via_url(url: str, dest: Path, max_bytes: int = MAIL_LIMIT * 3,
                     if total > max_bytes:
                         f.close()
                         dest.unlink(missing_ok=True)
-                        return False, None, f"文件超过下载上限 {human_size(max_bytes)}"
+                        return False, None, f"文件超过下载上限 {human_size(max_bytes)}", True
                     f.write(chunk)
         if total == 0:
             dest.unlink(missing_ok=True)
-            return False, None, "链接下载到 0 字节"
-        return True, dest, ""
+            return False, None, "链接下载到 0 字节", True
+        bad = _content_mismatch(dest)
+        if bad:
+            dest.unlink(missing_ok=True)
+            return False, None, bad, True
+        return True, dest, "", False
     except urllib.error.HTTPError as e:
-        return False, None, f"HTTP {e.code} {e.reason}"
+        code = getattr(e, "code", 0) or 0
+        msg = e.headers.get("X-Error-Message") if getattr(e, "headers", None) else ""
+        ecode = e.headers.get("X-Error-Code") if getattr(e, "headers", None) else ""
+        detail = f"HTTP {code} {getattr(e, 'reason', '') or ''}".strip()
+        if msg:
+            detail += f"（{msg}）"
+            if needs_login(msg):
+                # 这句话会进回信正文，所以只说人话，**不提**内部配置项（那是给运维看日志的）
+                detail += "——该附件是「超大附件」，取回需要邮箱网页登录态"
+        elif ecode:
+            detail += f"（X-Error-Code {ecode}）"
+        return False, None, detail, code not in _TRANSIENT_HTTP
     except Exception as e:
-        return False, None, f"{type(e).__name__}: {e}"
+        # 超时 / 连接重置 / DNS 等：算瞬时故障，可以重试
+        return False, None, f"{type(e).__name__}: {e}", False
+
+
+def _content_mismatch(path: Path) -> str:
+    """下载到的内容跟扩展名对不上（常见：网关拦截页、登录页）"""
+    ext = path.suffix.lower()
+    try:
+        with open(path, "rb") as f:
+            head = f.read(512)
+    except Exception:
+        return ""
+    if not head:
+        return ""
+    if ext == ".tar":
+        try:
+            with open(path, "rb") as f:
+                f.seek(257)
+                return "" if f.read(5) == b"ustar" else "下载到的内容不是 tar 包（可能被网关拦截）"
+        except Exception:
+            return ""
+    magics = _MAGIC.get(ext)
+    if not magics:
+        return ""
+    if any(head.startswith(m) for m in magics):
+        return ""
+    low = head[:64].lstrip().lower()
+    if low.startswith((b"<", b"{", b"[")) or "html" in low:
+        return "下载到的不是压缩包，而是错误页/登录页（可能被网关拦截）"
+    return "下载到的内容不是 %s 压缩包" % (ext.lstrip("."),)
 
 
 # ------------------------------------------------------------------ 文案
@@ -97,10 +193,17 @@ def reply_link_only(subject: str, items) -> str:
     """
     lines = []
     for name, size, err in items:
-        lines.append(f"- {name}（{human_size(size)}）：{err or '无法直接取回'}")
+        shown = err or "无法直接取回"
+        if needs_login(err):
+            # 服务端原始英文报错（Need MAIL5K= in Cookie）留给日志，发给发件人的只写人话
+            shown = "该附件以「超大附件」方式送达，链接需要邮箱网页登录态才能打开"
+        elif len(shown) > 160:
+            shown = shown[:160] + "…"
+        lines.append(f"- {name}（{human_size(size)}）：{shown}")
     detail = "\n".join(lines)
 
     over = [x for x in items if x[1] and x[1] > MAIL_LIMIT]
+    login = [x for x in items if not over and needs_login(x[2])]
     if over:
         head = (f"《{subject}》的附件确实**超过了邮箱的 20MB 上限**，"
                 f"邮件系统只给了一个下载直链，我这边无法直接取回。")
@@ -111,10 +214,18 @@ def reply_link_only(subject: str, items) -> str:
     else:
         head = (f"《{subject}》的附件是**以链接形式**送达的（邮件系统只给了下载直链，"
                 f"没有给可用的附件句柄），我这边取不回该文件。")
+        if login:
+            head += ("\n\n具体原因：这些附件是以「**超大附件**」方式发出的，"
+                     "它的下载链接需要**邮箱网页登录态**才能打开（匿名请求会被服务端拒绝），"
+                     "所以自动化流程无法直接取回。")
         advise = """处理办法（任选其一）：
 1. **换成普通附件重发**：用「压缩 → 发送」把 zip 作为附件发出（不要用「超大附件」方式）；
 2. **给一个可直链下载的压缩包地址**：在正文里贴 https:// 直链，免登录可下；
 3. **直接贴代码**：代码量不大时贴正文，并注明文件名。"""
+
+    footer = "" if over else """
+补充说明：附件大小以邮件系统返回的信息为准（上面已列出），并不是因为超过 20MB
+——本封邮件的附件实际大小见上。"""
 
     return f"""你好，
 
@@ -124,9 +235,7 @@ def reply_link_only(subject: str, items) -> str:
 {detail}
 
 {advise}
-
-补充说明：附件大小以邮件系统返回的信息为准（上面已列出），并不是因为超过 20MB
-——本封邮件的附件实际大小见上。
+{footer}
 
 谢谢。"""
 

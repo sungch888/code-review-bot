@@ -45,6 +45,7 @@ python bot.py logs       # 查看日志（--id msg_xxx 看单个任务的审核�
 python bot.py process --id msg_xxx   # 手动处理某个任务
 python bot.py retry --id msg_xxx     # 重置任务状态（重新处理）
 python bot.py model                  # 查看/修改审核模型
+python bot.py cookie                 # 配置/查看「超大附件」直链的登录态 Cookie
 python bot.py ui                     # 启动可操作控制台 UI
 ```
 
@@ -385,6 +386,48 @@ reasoning_content 长度: 56979                          ← 只有半截内心�
 - 回复正文与报告经过 `redact()`，连「本机器人自己的密钥」都会被掩掉；
 - 有回归测试锁住这些行为（`test_llm.py`、`test_ui.py`）。
 
+### 超大附件（只有 download_url）怎么处理
+
+邮件系统对「超大附件」只给一个下载直链，不给 `attachment_id`（`attachment +download` 用不了）。
+直链会 302 到 CDN，CDN 再要求带 `MAIL5K` 会话 Cookie：
+
+```
+$ python bot.py cookie --test "https://wx.mail.qq.com/ftn/download?key=..."
+下载失败: HTTP 400 Bad Request（Need MAIL5K= in Cookie）——该附件是「超大附件」，
+          取回需要邮箱网页登录态
+→ 需要登录态：浏览器登录 mail.qq.com → 开发者工具 → Application/Cookies
+  复制 MAIL5K 的值 → `python bot.py cookie --set "MAIL5K=值"`
+```
+
+**配置之后就能自动取回**（不再给发件人发「取不回」的回信）：
+
+```bash
+python bot.py cookie --set "MAIL5K=xxxxx"        # 只给值也行，会自动补 MAIL5K=
+python bot.py cookie --set "$(cat cookies.txt)"   # 也支持浏览器导出的 cookies.txt
+python bot.py cookie                             # 查看当前状态（值打码）
+python bot.py cookie --set -                      # 清除
+```
+
+也可以写在配置里：
+
+```json
+"download_cookie": "",          // 直接放 Cookie 串（MAIL5K=...; uin=...）
+"download_cookie_file": ""       // 或指向 cookies.txt（相对/绝对路径都行）
+```
+
+环境变量 `REVIEW_BOT_DOWNLOAD_COOKIE` 作为兜底。优先级：
+`download_cookie` > `download_cookie_file` > 环境变量。
+
+其他行为：
+
+| 情况 | 行为 |
+|------|------|
+| 302 跳转 | 自动跟随（保留 Cookie） |
+| 5xx / 超时 / 连接重置 | 退避重试 3 次（瞬时故障才重试） |
+| 4xx（包括缺 Cookie 的 400） | **不重试**（省一次无辜等待） |
+| 返回 HTML / 0 字节 / 内容是错误页 | 判失败并说明，**不会把错误页当代码包解压** |
+| 失败回信 | 如实写「超大附件 + 需要网页登录态」，并给 3 种替代办法；不写内部配置项名 |
+
 ---
 
 ## 七、报告模板化（单一事实源）
@@ -580,7 +623,7 @@ python bot.py retry   --id msg_xxx --baseline -         # 不做回归核对，�
 | 场景 | 处理 | 发件人收到 |
 |------|------|-----------|
 | 无附件 | 直接回信 | 3 种重新发送的方式 |
-| 附件仅提供直链且取不回 | 先尝试直链下载，失败才回信 | **如实说明大小**（363KB 就写 363KB）+ 3 种替代方案 |
+| 附件仅提供直链 | 先试直链（跟 302 / 带 Cookie / 瞬时故障重试），成了就正常审；失败才回信 | 如实说明大小（363KB 就写 363KB）+ 说清「超大附件需网页登录态」+ 3 种替代方案 |
 | 附件确实 > 20MB | 回信 | 分卷 / 网盘直链 / 精简依赖 3 种方案 |
 | 附件下载失败（网络） | 回信 | 稍后重发 / 换链接 |
 | 压缩包损坏或加密 | 回信 | 重新压缩 / 去掉密码 / 换标准格式 |

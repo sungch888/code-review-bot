@@ -37,7 +37,7 @@ rc |= run([sys.executable, "-m", "pyflakes", "bot.py", "ui.py", "lib/md2html.py"
            "test_retry.py", "test_chunk.py", "test_lock.py",
            "test_anomaly.py", "test_llm.py",
            "test_approval.py", "test_providers.py", "test_config_robust.py",
-           "test_methodology.py", "test_regression.py"],
+           "test_methodology.py", "test_regression.py", "test_download.py"],
          "1. 静态检查 pyflakes")
 rc |= run([sys.executable, "test_requirements.py"], "2. 审核要求解析")
 rc |= run([sys.executable, "test_report_spec.py"], "3. 报告规范/校验/渲染")
@@ -53,6 +53,7 @@ rc |= run([sys.executable, "test_config_robust.py"], "12. 配置健壮性（缺�
 rc |= run([sys.executable, "test_methodology.py"], "13. 审核方法论注入 + 报告不泄露来源")
 rc |= run([sys.executable, "test_no_window.py"], "14. 黑窗防护（CREATE_NO_WINDOW）")
 rc |= run([sys.executable, "test_regression.py"], "15. 多轮闭环审核（回归核对）")
+rc |= run([sys.executable, "test_download.py"], "16. 超大附件直链取回")
 
 print("\n" + "=" * 40)
 print("全部通过" if rc == 0 else "存在失败项")

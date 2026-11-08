@@ -718,6 +718,58 @@ def safe_extract_tar(tf: tarfile.TarFile, dest: Path, budget):
             log(f"解压条目失败 {name}: {e}", "WARN")
 
 
+# ---------------------------------------------------------------- 直链下载登录态
+COOKIE_ENV = "REVIEW_BOT_DOWNLOAD_COOKIE"
+
+
+def _parse_cookie_file(raw: str) -> str:
+    """兼容两种格式：裸 cookie 串 / 浏览器导出的 Netscape cookies.txt"""
+    pairs = {}
+    for ln in raw.splitlines():
+        if not ln.strip() or ln.lstrip().startswith("#"):
+            continue
+        parts = ln.split("\t")
+        if len(parts) >= 7:
+            kv = f"{parts[5].strip()}={parts[6].strip()}"
+        elif "=" in ln:
+            kv = ln.strip().rstrip(";")
+        else:
+            continue
+        pairs[kv.split("=", 1)[0].strip()] = kv
+    return "; ".join(pairs.values())
+
+
+def download_cookie() -> str:
+    """「超大附件」直链所需的邮箱网页登录态 Cookie
+
+    优先级：config.download_cookie > config.download_cookie_file > 环境变量。
+    取不到就返回空串（匿名尝试，失败了会如实回信说明原因）。
+    """
+    c = (CONFIG.get("download_cookie") or "").strip()
+    if c:
+        return c
+    f = (CONFIG.get("download_cookie_file") or "").strip()
+    if f:
+        p = Path(f)
+        if not p.is_absolute():
+            p = BASE / f
+        try:
+            raw = p.read_text(encoding="utf-8", errors="replace")
+            if raw.strip():
+                return _parse_cookie_file(raw)
+        except Exception as e:
+            log(f"读取 download_cookie_file 失败: {e}", "WARN")
+    return (os.environ.get(COOKIE_ENV) or "").strip()
+
+
+def mask_cookie(c: str) -> str:
+    """日志/界面里只显示 Cookie 名，不泄露值"""
+    if not c:
+        return ""
+    names = [kv.split("=", 1)[0].strip() for kv in c.split(";") if kv.strip()]
+    return ",".join(names[:4]) + "=***"
+
+
 def extract_archive(src: Path, dest: Path) -> Path:
     dest.mkdir(parents=True, exist_ok=True)
     name = src.name.lower()
@@ -2261,13 +2313,18 @@ def process_task(mid: str) -> str:
                 url = a.get("download_url") or ""
                 if url:
                     dest = dl / f"url_{fname}"
-                    ok, path, err = ANOMALY.download_via_url(url, dest)
+                    ok, path, err = ANOMALY.download_via_url(
+                        url, dest, cookie=download_cookie())
                     if ok:
                         saved.append(path)
                         t.setdefault("attachments", {})[f"url:{fname}"] = str(path)
                         log(f"[{mid}] 直链下载成功: {path.name} ({path.stat().st_size} bytes)")
                         continue
                     log(f"[{mid}] 直链下载失败: {fname} -> {err}", "WARN")
+                    if ANOMALY.needs_login(err):
+                        log(f"[{mid}] 该链接需要邮箱网页登录态（超大附件）："
+                            f"配置后可直接取回 —— `python bot.py cookie --set \"MAIL5K=...\"`",
+                            "WARN")
                     link_only.append((fname, size, err))
                 else:
                     link_only.append((fname, size, "邮件系统未提供可用的下载地址"))
@@ -3032,6 +3089,52 @@ def _model_list(quiet: bool = False) -> int:
     return 0
 
 
+def cmd_cookie(args) -> int:
+    """配置/测试「超大附件」直链所需的邮箱网页登录态 Cookie
+
+    直链 302 到 CDN 后需要 `MAIL5K` Cookie，否则返回
+    `400 X-Error-Message: Need MAIL5K= in Cookie`。
+    """
+    if getattr(args, "set", None) is not None:
+        v = (args.set or "").strip()
+        if v in ("-", ""):
+            CONFIG["download_cookie"] = ""
+            _save_config()
+            print("已清除 download_cookie（直链将按匿名请求尝试）")
+        else:
+            CONFIG["download_cookie"] = v
+            _save_config()
+            print(f"已保存 download_cookie: {mask_cookie(v)}")
+    if getattr(args, "test", None):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            dest = Path(d) / "probe.bin"
+            ok, path, err = ANOMALY.download_via_url(
+                args.test, dest, cookie=download_cookie(), retries=2)
+            if ok:
+                print(f"下载成功: {path.name} {path.stat().st_size:,} bytes")
+                return 0
+            print(f"下载失败: {err}")
+            if ANOMALY.needs_login(err):
+                print("→ 需要登录态：浏览器登录 mail.qq.com → 开发者工具 → "
+                      "Application/Cookies 复制 MAIL5K 的值 → "
+                      "`python bot.py cookie --set \"MAIL5K=值\"`")
+            return 1
+    cur = download_cookie()
+    print(f"当前 Cookie: {mask_cookie(cur) if cur else '未配置'}")
+    if (CONFIG.get("download_cookie") or "").strip():
+        src = "config.json 的 download_cookie"
+    elif (CONFIG.get("download_cookie_file") or "").strip():
+        src = f"config.json 的 download_cookie_file（{CONFIG['download_cookie_file']}）"
+    elif (os.environ.get(COOKIE_ENV) or "").strip():
+        src = f"环境变量 {COOKIE_ENV}"
+    else:
+        src = "未配置"
+    print(f"来源: {src}")
+    print("用途: 邮件系统以「超大附件」形式送达时，直链需要邮箱网页登录态才能下载")
+    return 0
+
+
 def cmd_model(args) -> int:
     """模型配置：python bot.py model [--base-url X --api-key Y --set M] [--list] [--test]"""
     changed = False
@@ -3186,6 +3289,10 @@ def main():
     p.add_argument("--fallback", default=None, help="上游繁忙时自动切换的备用模型")
     p.add_argument("--max-tokens", dest="max_tokens", default=None, help="单次最大输出 tokens")
     p.add_argument("--temperature", default=None, help="采样温度")
+    p = sub.add_parser("cookie", help="配置「超大附件」直链所需的邮箱网页 Cookie（MAIL5K）")
+    p.add_argument("--set", default=None,
+                   help="设置 Cookie 串（只给值会自动补 MAIL5K=）；传 - 清除")
+    p.add_argument("--test", default=None, help="用指定直链测试（能下就说明 Cookie 有效）")
     p = sub.add_parser("ui")
     p.add_argument("--port", type=int, default=8770)
     p.add_argument("--no-open", action="store_true")
@@ -3269,6 +3376,8 @@ def main():
             print(f.read_text(encoding="utf-8", errors="replace")[-8000:] if f.exists() else "无日志")
     elif cmd == "model":
         sys.exit(cmd_model(a))
+    elif cmd == "cookie":
+        sys.exit(cmd_cookie(a))
     elif cmd == "ui":
         ui_args = [sys.executable, str(BASE / "ui.py"), "--port", str(a.port)]
         if a.no_open:
