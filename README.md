@@ -46,6 +46,7 @@ python bot.py process --id msg_xxx   # 手动处理某个任务
 python bot.py retry --id msg_xxx     # 重置任务状态（重新处理）
 python bot.py model                  # 查看/修改审核模型
 python bot.py cookie                 # 配置/查看「超大附件」直链的登录态 Cookie
+python bot.py resend --id msg_xxx    # 重新生成摘要并补发报告（不重新审核）
 python bot.py ui                     # 启动可操作控制台 UI
 ```
 

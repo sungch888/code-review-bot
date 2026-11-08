@@ -2753,6 +2753,52 @@ def do_reply(mid, body, files):
     return d
 
 
+def resend_task(mid: str, regen_summary: bool = True) -> dict:
+    """重新生成摘要并**补发**报告（不重新审核）
+
+    用途：报告已经生成、也发出去了，但摘要/正文有问题时，
+    不用重跑一遍审核（几分钟 + 模型费用），直接从已有报告重算再发一封。
+    """
+    t = load_task(mid)
+    if t is None:
+        raise RuntimeError("任务不存在")
+    rpt = Path(t.get("report") or (WORK / mid / "report"))
+    if not rpt.is_dir():
+        raise RuntimeError(f"找不到报告目录：{rpt}")
+    md = rpt / "代码审核报告.md"
+    if not md.is_file():
+        raise RuntimeError("找不到代码审核报告.md")
+    summ = rpt / "summary.md"
+    if regen_summary:
+        text = md.read_text(encoding="utf-8", errors="replace")
+        derived = build_summary_from_report(text, t.get("new_issues") or 0)
+        if derived:
+            summ.write_text(redact(derived), encoding="utf-8")
+            log(f"[{mid}] 摘要已重新生成 {summ.stat().st_size} bytes")
+            # 摘要补上了，之前那条「摘要缺失」的警告就过时了，别再随信发给发件人
+            warns = [w for w in (t.get("report_warnings") or [])
+                     if "摘要缺失" not in w]
+            if warns != (t.get("report_warnings") or []):
+                t["report_warnings"] = warns
+                log(f"[{mid}] 已移除过时的「摘要缺失」警告")
+        else:
+            log(f"[{mid}] 报告里提取不出摘要，保留原文件", "WARN")
+    files = []
+    for name in CONFIG["attach_report_names"]:
+        p = rpt / name
+        if p.exists():
+            files.append(p)
+    if not files:
+        files = [md]
+    body = build_body(t, rpt, files)
+    do_reply(mid, body, files)
+    t["resent_at"] = iso()
+    t["resend_count"] = int(t.get("resend_count") or 0) + 1
+    save_task(t)
+    log(f"[{mid}] 已补发报告（含附件 {len(files)} 个）")
+    return t
+
+
 def build_body(task, report_dir: Path, files) -> str:
     """邮件正文：只引用 summary.md，不内联完整报告（避免触发邮件安全过滤）"""
     summ = report_dir / "summary.md"
@@ -3876,6 +3922,9 @@ def main():
     p.add_argument("--fallback", default=None, help="上游繁忙时自动切换的备用模型")
     p.add_argument("--max-tokens", dest="max_tokens", default=None, help="单次最大输出 tokens")
     p.add_argument("--temperature", default=None, help="采样温度")
+    p = sub.add_parser("resend", help="重新生成摘要并补发报告（不重新审核）")
+    p.add_argument("--id", required=True, help="任务 id")
+    p.add_argument("--no-summary", action="store_true", help="不重新生成摘要，直接重发原报告")
     p = sub.add_parser("cookie", help="配置「超大附件」直链所需的邮箱网页 Cookie（MAIL5K）")
     p.add_argument("--set", default=None,
                    help="设置 Cookie 串（只给值会自动补 MAIL5K=）；传 - 清除")
@@ -3965,6 +4014,13 @@ def main():
         sys.exit(cmd_model(a))
     elif cmd == "cookie":
         sys.exit(cmd_cookie(a))
+    elif cmd == "resend":
+        try:
+            resend_task(a.id, regen_summary=not getattr(a, "no_summary", False))
+            print(f"已补发报告: {a.id}")
+        except Exception as e:
+            print(f"补发失败: {e}")
+            sys.exit(1)
     elif cmd == "ui":
         ui_args = [sys.executable, str(BASE / "ui.py"), "--port", str(a.port)]
         if a.no_open:

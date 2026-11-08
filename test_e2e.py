@@ -599,6 +599,41 @@ def main():
     finally:
         env.close()
 
+    # ================= S13 resend：补发不重审，摘要自动修好 ============
+    env = Env()
+    try:
+        env.add_task("msg_s13", "代码审核 - 补发", SMALL)
+        env.run("msg_s13")
+        t = B.load_task("msg_s13")
+        rpt = Path(t["report"])
+        # 模拟「摘要坏掉 + 带着过时警告」
+        (rpt / "summary.md").write_text("代码包已完成静态代码审核，详细结论见附件报告。",
+                                         encoding="utf-8")
+        t["report_warnings"] = ["摘要缺失，已使用兼底文案"]
+        B.save_task(t)
+        n_before = len(env.provider.prompts)
+
+        t2 = B.resend_task("msg_s13")
+        check("resend 没有重新调用模型（不重审）",
+              len(env.provider.prompts) == n_before, f"{n_before} -> {len(env.provider.prompts)}")
+        summ = (rpt / "summary.md").read_text(encoding="utf-8")
+        check("resend 把摘要修好了", "详细结论见附件报告" not in summ, summ[:80])
+        check("resend 摘要有结论档位",
+              any(k in summ for k in ("可放行", "修改后放行", "不建议放行")), summ[:200])
+        check("resend 清掉了过时的「摘要缺失」警告",
+              not any("摘要缺失" in w for w in (t2.get("report_warnings") or [])),
+              str(t2.get("report_warnings")))
+        check("resend 记录了补发次数", t2.get("resend_count") == 1 and t2.get("resent_at"),
+              str(t2.get("resend_count")))
+        check("resend 又发了一封邮件", len(env.replies.get("msg_s13", [])) == 2,
+              str(len(env.replies.get("msg_s13", []))))
+        check("resend 的邮件带了报告附件",
+              len(env.files("msg_s13")) >= 1, str(env.files("msg_s13")))
+        check("resend 邮件正文里没有兼底文案",
+              "详细结论见附件报告" not in env.body("msg_s13"), env.body("msg_s13")[:200])
+    finally:
+        env.close()
+
     srv.close()
     srv5.close()
     print(f"\n{PASS}/{PASS + FAIL} 通过")
