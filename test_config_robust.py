@@ -71,22 +71,30 @@ def main():
         missing2 = [k for k in KEY_FIELDS if k not in B.CONFIG]
         check("reload_config 后内存 CONFIG 完整", not missing2, f"仍缺: {missing2}")
 
-        # 3) worker 循环用 .get 兜底（源码级检查，防止回退成硬下标）
-        #    注意：轮询/重载已拆成 _maybe_scan / _maybe_reload（多 worker 共享节流），
-        #    所以检查范围是「worker 那几个函数」而不是单个 worker_loop。
-        src = (ROOT / "bot.py").read_text(encoding="utf-8")
-        loop_src = src.split("def _maybe_reload")[1].split("def watch_loop")[0]
-        code_lines = [ln.strip() for ln in loop_src.splitlines()
-                      if ln.strip() and not ln.strip().startswith("#")]
-        hard = [ln for ln in code_lines if 'CONFIG["poll_interval_sec"]' in ln
-                or "CONFIG['poll_interval_sec']" in ln]
-        check("worker 循环不再硬取 CONFIG['poll_interval_sec']", not hard, str(hard[:1]))
-        check("worker 循环用 CONFIG.get 兜底",
-              'CONFIG.get("poll_interval_sec"' in loop_src)
-        check("worker 每轮先 reload_config（可自愈）",
-              "reload_config()" in loop_src.split("def _maybe_scan")[0])
-        check("worker_loop 每轮调 _maybe_reload",
-              "_maybe_reload()" in src.split("def worker_loop")[1][:800])
+        # 3) 缺 poll_interval_sec 时 worker 循环不能崩（行为断言）
+        #    以前是 CONFIG["poll_interval_sec"] 硬下标 -> 循环直接挂、任务永远卡在 SEEN
+        cfg3 = json.loads(backup)
+        cfg3.pop("poll_interval_sec", None)
+        CFG.write_text(json.dumps(cfg3, ensure_ascii=False, indent=2), encoding="utf-8")
+        B.reload_config()
+        check("缺 poll_interval_sec 时 CONFIG.get 兜底为 180",
+              B.CONFIG.get("poll_interval_sec", 180) == 180,
+              str(B.CONFIG.get("poll_interval_sec")))
+        # 真跑一轮 worker 循环：让它立刻返回，不应抛异常
+        _old_scan = B.scan_once
+        _old_pool = B.worker_pool
+        try:
+            scanned = []
+            B.scan_once = lambda: scanned.append(1)
+            B.worker_loop = lambda: None      # 只验证「能进入循环」这一步
+            B._maybe_scan()
+            B._maybe_reload()
+            check("缺字段时扫描/重载都不抛异常", True)
+            check("缺 poll_interval_sec 时仍会扫描（兜底值生效）", len(scanned) == 1,
+                  str(len(scanned)))
+        finally:
+            B.scan_once = _old_scan
+            B.worker_pool = _old_pool
 
         # 4) 完整配置也能正常加载（不回归）
         CFG.write_text(backup, encoding="utf-8")

@@ -9,6 +9,7 @@
 """
 import http.client
 import json
+import os
 import re
 import sys
 import threading
@@ -72,11 +73,35 @@ def flash_of(hdr):
 def main():
     # 回归：直接 `bot.py run` 启动时也要写 pid 文件，
     # 否则控制台会一直显示「守护进程未运行」（实际它活着）
-    src = (BASE / "bot.py").read_text(encoding="utf-8")
-    run_all_src = src.split("def run_all")[1][:900]
-    check("run_all() 会写 pid 文件", "PIDFILE.write_text" in run_all_src,
-          run_all_src[:120])
-    check("run_all() 退出时清理 pid 文件", "PIDFILE.unlink" in run_all_src)
+    # —— 用行为断言：真跑一次 run_all（把 worker 换成立即返回），看文件有没有被写/清
+    _old_pidfile = B.PIDFILE
+    _old_pool = B.worker_pool
+    _old_watch = B.watch_supervisor
+    _tmp_pid = BASE / "state" / "test_run_all.pids"
+    try:
+        B.PIDFILE = _tmp_pid
+        _tmp_pid.unlink(missing_ok=True)
+        B.worker_pool = lambda: None          # 让 run_all 立刻结束
+        B.watch_supervisor = lambda: None
+        B.run_all()
+        check("run_all() 退出后清理 pid 文件", not _tmp_pid.exists())
+        # 再验证「运行期间文件存在」：把 worker 换成一个会看文件的假 worker
+        seen = {}
+
+        def _probe_worker():
+            seen["exists"] = _tmp_pid.exists()
+            seen["content"] = _tmp_pid.read_text(encoding="utf-8") if _tmp_pid.exists() else ""
+
+        B.worker_pool = _probe_worker
+        B.run_all()
+        check("run_all() 运行期间写了 pid 文件", seen.get("exists"), str(seen))
+        check("pid 文件里是本进程 pid", str(os.getpid()) in (seen.get("content") or ""),
+              seen.get("content"))
+    finally:
+        B.PIDFILE = _old_pidfile
+        B.worker_pool = _old_pool
+        B.watch_supervisor = _old_watch
+        _tmp_pid.unlink(missing_ok=True)
 
     # --- 造一个带 XSS payload 的任务 + 报告 ---
     xss_mid = "msg_UItestXSS"

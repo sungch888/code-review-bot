@@ -341,12 +341,6 @@ except Exception:
     LLM = None
 
 
-def spec_sections_baseline_titles() -> list:
-    """只在「有上一轮基线」时才必需的额外章节（目前是上轮问题跟踪）"""
-    return [s.get("title", "") for s in REPORT_SPEC.get("sections_when_baseline", [])
-            if s.get("required") and s.get("title")]
-
-
 def spec_sections(baseline: bool = False) -> list:
     """本次适用的章节规范（基础 + 有基线时追加）"""
     sections = list(REPORT_SPEC.get("sections", []))
@@ -1143,7 +1137,8 @@ def collect_source_files(src_root: Path, limit: int):
 # 项目身份**只从邮件主题推导**（主题是发起人唯一稳定的项目标识）；
 # 认不出项目名就干脆不做回归核对——宁可少做，也不能把两个项目的报告串起来。
 TRACK_VERDICTS = ("已修复", "部分修复", "未修复", "无法确认")
-TRACK_COLUMNS = ["编号", "级别", "上轮问题", "本轮判定", "证据", "说明"]
+# 跟踪表列名也从模板取（改 templates/report_sections.json 即改这里）
+TRACK_COLUMNS = spec_table_columns("baseline_tracking")
 
 _SUBJ_PREFIX_RE = re.compile(r"^\s*(?:re|fw|fwd|回复|答复|转发|回执|res)\s*[:：]\s*", re.I)
 _ROUND_MARK_RE = re.compile(
@@ -2661,7 +2656,7 @@ def ack_sweep() -> int:
     sent = 0
     for t in all_tasks():
         state = (t.get("state") or "").upper()
-        if state in TERMINAL_STATES or state == "":
+        if state not in WORKING_STATES:      # 终态/未知状态一律不发
             continue
         if state == State.FAILED and t.get("attempts", 0) >= CONFIG["max_retries"]:
             continue
@@ -3329,20 +3324,6 @@ def get_active_provider() -> str:
     return (CONFIG.get("active_provider") or "").strip()
 
 
-def _snapshot_to_top() -> dict:
-    """把当前顶层 llm_* 存为一个 entry（用于 providers[name]）"""
-    return {
-        "base_url": CONFIG.get("llm_base_url", "") or "",
-        "protocol": CONFIG.get("llm_protocol", "openai") or "openai",
-        "api_key": CONFIG.get("llm_api_key", "") or "",
-        "model": CONFIG.get("llm_model", "") or "",
-        "thinking": CONFIG.get("llm_thinking", "") or "",
-        "disable_thinking": bool(CONFIG.get("llm_disable_thinking", True)),
-        "max_output_tokens": CONFIG.get("llm_max_output_tokens") or 16000,
-        "temperature": CONFIG.get("llm_temperature", 0.2),
-    }
-
-
 def _top_from_entry(v: dict) -> dict:
     """把 entry 展开为顶层 llm_* 字段"""
     m = {
@@ -3490,19 +3471,6 @@ def delete_provider(name: str, save: bool = True) -> str:
     if save:
         _save_config()
     return ""
-
-
-def migrate_legacy_provider(save: bool = True) -> str:
-    """首次升级：顶层有 llm_* 但 providers 为空时，自动存为 default。"""
-    provs = CONFIG.get("providers") or {}
-    if provs:
-        return ""
-    if not (CONFIG.get("llm_base_url") or CONFIG.get("llm_model")):
-        return ""
-    err = create_provider("default", _snapshot_to_top(), activate=True, save=save)
-    if not err and save:
-        log("已把现有顶层模型配置存为命名配置 default")
-    return err
 
 
 # 兼容旧调用（UI/测试里可能用过）

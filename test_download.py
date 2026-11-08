@@ -18,6 +18,7 @@
 """
 import http.server
 import os
+import types
 import sys
 import tempfile
 import threading
@@ -110,6 +111,38 @@ class H(http.server.BaseHTTPRequestHandler):
         self.send_response(500)
         self.send_header("Content-Length", "0")
         self.end_headers()
+
+
+class _CookieServer:
+    """只在带 MAIL5K Cookie 时才给文件的本地服务（模拟真实 CDN）"""
+
+    def __init__(self):
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                if "MAIL5K=" not in (self.headers.get("Cookie") or ""):
+                    self.send_response(400)
+                    self.send_header("X-Error-Message", "Need MAIL5K= in Cookie")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                body = ZIP
+                self.send_response(200)
+                self.send_header("Content-Type", "application/zip")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        self.srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def url(self, path):
+        return f"http://127.0.0.1:{self.srv.server_address[1]}{path}"
+
+    def close(self):
+        self.srv.shutdown()
 
 
 def main():
@@ -230,11 +263,50 @@ def main():
         check("超 20MB 回信不自相矛盾（不写「并不是因为超过 20MB」）",
               "并不是因为超过 20MB" not in over, "")
 
-        # ---------- D. 接线 ----------
-        src = (BASE / "bot.py").read_text(encoding="utf-8")
-        check("process_task 下载直链时传了 Cookie", "cookie=download_cookie()" in src, "")
-        check("失败时提示配置登录态（日志）", "needs_login(err)" in src, "")
-        check("有 CLI 可配置 Cookie", 'sub.add_parser("cookie"' in src, "")
+        # ---------- D. 接线（行为断言，不看源码字符串）----------
+        # 1) 下载直链时确实用上了 Cookie：让直链只在带 Cookie 时才给文件
+        srv2 = _CookieServer()
+        try:
+            ok, path, err = A.download_via_url(srv2.url("/need"), tmp / "ck.zip",
+                                               cookie=B.download_cookie())
+            check("下载直链时真的带上了 Cookie（不配置就失败）",
+                  not ok and A.needs_login(err), err)
+            ok2, path2, err2 = A.download_via_url(srv2.url("/need"), tmp / "ck2.zip",
+                                                  cookie="MAIL5K=x")
+            check("带上 Cookie 后同一个链接能下到", ok2 and path2, err2)
+        finally:
+            srv2.close()
+
+        # 2) 配置来源真的生效（config / 文件 / 环境变量）
+        cfg_bak = B.CONFIG.get("download_cookie")
+        file_bak = B.CONFIG.get("download_cookie_file")
+        try:
+            B.CONFIG["download_cookie"] = "MAIL5K=abc"
+            B.CONFIG["download_cookie_file"] = ""
+            check("配置里的 Cookie 生效", B.download_cookie() == "MAIL5K=abc")
+            B.CONFIG["download_cookie"] = ""
+            B.CONFIG["download_cookie_file"] = str(ck_file)
+            check("cookies.txt 生效", "MAIL5K=abc123" in B.download_cookie())
+        finally:
+            B.CONFIG["download_cookie"] = cfg_bak or ""
+            B.CONFIG["download_cookie_file"] = file_bak or ""
+
+        # 3) CLI 能配 Cookie（真调 cmd_cookie，不看源码）
+        old_save = B._save_config
+        saved = {}
+        B._save_config = lambda: saved.update(B.CONFIG)
+        try:
+            rc = B.cmd_cookie(types.SimpleNamespace(set="MAIL5K=cli-value", test=None))
+            check("CLI cookie --set 能保存", rc == 0 and saved.get("download_cookie")
+                  == "MAIL5K=cli-value", str(saved.get("download_cookie")))
+            rc = B.cmd_cookie(types.SimpleNamespace(set="-", test=None))
+            check("CLI cookie --set - 能清除", rc == 0 and not saved.get("download_cookie"),
+                  str(saved.get("download_cookie")))
+        finally:
+            B._save_config = old_save
+            B.CONFIG["download_cookie"] = cfg_bak or ""
+            B.CONFIG["download_cookie_file"] = file_bak or ""
+
         check("配置示例里有 download_cookie", "download_cookie" in
               (BASE / "config.example.json").read_text(encoding="utf-8"), "")
     finally:

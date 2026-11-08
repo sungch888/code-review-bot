@@ -418,10 +418,39 @@ def main():
         for k in ("max_workers", "llm_max_concurrency", "chunk_workers",
                   "llm_rate_cooldown_sec"):
             check(f"配置示例含 {k}", f'"{k}"' in ex)
-        src_txt = (BASE / "bot.py").read_text(encoding="utf-8")
-        check("run_all 用 worker 池启动", "worker_pool()" in src_txt.split("def run_all")[1][:800])
-        check("worker 池里的线程是 daemon（不会卡住退出）",
-              "daemon=True)" in src_txt.split("def worker_pool")[1][:600])
+        # run_all 真的走 worker 池（行为断言）：把 worker 换成假的，看被调用了几次
+        _old_pool, _old_watch = B.worker_pool, B.watch_supervisor
+        _old_pid = B.PIDFILE
+        _tmp_pid = BASE / "state" / "test_conc_run_all.pids"
+        try:
+            B.PIDFILE = _tmp_pid
+            _tmp_pid.unlink(missing_ok=True)
+            B.watch_supervisor = lambda: None
+            calls = []
+            B.worker_pool = lambda: calls.append(1)
+            B.run_all()
+            check("run_all 走的是 worker 池", len(calls) == 1, str(calls))
+        finally:
+            B.worker_pool, B.watch_supervisor, B.PIDFILE = _old_pool, _old_watch, _old_pid
+            _tmp_pid.unlink(missing_ok=True)
+
+        # worker 池的线程是 daemon（不会卡住进程退出）：真起一次再退出
+        _old_pool2 = B.worker_pool
+        started = []
+        try:
+            def _fake_loop():
+                started.append(threading.current_thread().name)
+                time.sleep(0.05)
+            B.worker_loop = _fake_loop
+            B.CONFIG["max_workers"] = 2
+            B.worker_pool()
+            check("worker 池起了 2 个线程且都已结束",
+                  len(started) == 2, str(started))
+            check("worker 池的线程都是 daemon（主线程返回即退出）",
+                  all(t.daemon for t in threading.enumerate() if t.name.startswith("worker-")),
+                  str([(t.name, t.daemon) for t in threading.enumerate()]))
+        finally:
+            B.worker_pool = _old_pool2
     finally:
         for k, v in old_cfg.items():
             if v is None:
