@@ -95,8 +95,8 @@ def main():
     for nm, txt in (("单批", single), ("分批", chunk), ("汇总", merge)):
         check(f"{nm}提示词含「不要写进报告」禁令",
               "不要写进报告" in txt or "严禁" in txt, txt[-200:])
-    check("FIX_RULES 含禁令（修复重跑也不会泄露）",
-          "不得出现" in B.FIX_RULES and "方法论" in B.FIX_RULES)
+    check("修复规则含禁令（修复重跑也不会泄露）",
+          "不得出现" in B.fix_rules_text() and "方法论" in B.fix_rules_text())
 
     # ---------- C. 校验器与擦除 ----------
     # 正常报告不该被判泄露

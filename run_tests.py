@@ -38,7 +38,7 @@ rc |= run([sys.executable, "-m", "pyflakes", "bot.py", "ui.py", "lib/md2html.py"
            "test_anomaly.py", "test_llm.py",
            "test_approval.py", "test_providers.py", "test_config_robust.py",
            "test_methodology.py", "test_regression.py", "test_download.py",
-           "test_concurrency.py", "test_e2e.py"],
+           "test_concurrency.py", "test_e2e.py", "test_structural.py"],
          "1. 静态检查 pyflakes")
 rc |= run([sys.executable, "test_requirements.py"], "2. 审核要求解析")
 rc |= run([sys.executable, "test_report_spec.py"], "3. 报告规范/校验/渲染")
@@ -57,6 +57,7 @@ rc |= run([sys.executable, "test_regression.py"], "15. 多轮闭环审核（回�
 rc |= run([sys.executable, "test_download.py"], "16. 超大附件直链取回")
 rc |= run([sys.executable, "test_concurrency.py"], "17. 并发与限流冷却")
 rc |= run([sys.executable, "test_e2e.py"], "18. 端到端（假邮件 + 假模型 + 假 pi，十个场景）")
+rc |= run([sys.executable, "test_structural.py"], "19. 结构约束（状态机 / 规范单一来源 / 不静默吞异常）")
 
 print("\n" + "=" * 40)
 print("全部通过" if rc == 0 else "存在失败项")

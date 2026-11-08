@@ -297,11 +297,16 @@ def load_methodology(full: bool = True) -> str:
     """读取内部审核方法论（注入提示词用）
 
     方法论只影响**怎么审**，不会在报告里出现任何来源名称——报告只呈现结论。
-    读不到就返回空串，审核照常跑（不因为缺文件就失败）。
+    读不到就返回空串，审核照常跑（不因为缺文件就失败），
+    但**必须记 WARN**：静默失效会表现为「报告质量变差」，没人能归因。
     """
     try:
         raw = METH_PATH.read_text(encoding="utf-8")
-    except Exception:
+    except Exception as e:
+        log(f"审查方法论读取失败({e})，本次审核将不注入方法论（报告质量可能下降）", "WARN")
+        return ""
+    if not raw.strip():
+        log("审查方法论文件为空，本次审核将不注入方法论（报告质量可能下降）", "WARN")
         return ""
     # 去掉 HTML 注释（内部说明，不进提示词）
     raw = re.sub(r"<!--.*?-->", "", raw, flags=re.S).strip()
@@ -342,15 +347,28 @@ def spec_sections_baseline_titles() -> list:
             if s.get("required") and s.get("title")]
 
 
-def spec_sections_text(baseline: bool = False) -> str:
-    """把报告章节规范渲染成提示词片段（提示词与校验器共用一份规范）"""
+def spec_sections(baseline: bool = False) -> list:
+    """本次适用的章节规范（基础 + 有基线时追加）"""
     sections = list(REPORT_SPEC.get("sections", []))
     if baseline:
         extra = list(REPORT_SPEC.get("sections_when_baseline", []))
         # 插在「总体评价」之后：先看整体，再看上轮闭环
         sections = sections[:2] + extra + sections[2:]
+    return sections
+
+
+def spec_table_columns(section_id: str = "issues_table") -> list:
+    """某个表格章节的列定义（唯一来源：templates/report_sections.json）"""
+    for s in REPORT_SPEC.get("sections", []) + REPORT_SPEC.get("sections_when_baseline", []):
+        if s.get("id") == section_id:
+            return list(s.get("columns") or [])
+    return []
+
+
+def spec_sections_text(baseline: bool = False) -> str:
+    """把报告章节规范渲染成提示词片段（提示词与校验器共用一份规范）"""
     out = []
-    for s in sections:
+    for s in spec_sections(baseline):
         must = "必须" if s.get("required") else "可选"
         line = f"- （{must}）**{s.get('title')}**"
         if s.get("type") == "table":
@@ -359,6 +377,90 @@ def spec_sections_text(baseline: bool = False) -> str:
             line += f"。{s['hint']}"
         out.append(line)
     return "\n".join(out)
+
+
+def fix_rules_text() -> str:
+    """「请修订报告」的硬性规则（列名从规范生成，改模板即改这里）"""
+    cols = spec_table_columns("issues_table")
+    tr_cols = spec_table_columns("baseline_tracking")
+    rules = [
+        "要求：",
+        "1. 保留原有分析内容（不要重写、不要丢失已发现的问题）；",
+        "2. 补齐缺失章节，章节标题逐字使用规范中的标题；",
+    ]
+    n = len(rules)
+    if cols:
+        rules.append(f"{n}. 问题清单的列头必须严格为 `{' | '.join(cols)}`；")
+        n += 1
+    rules.append(f"{n}. 结论中必须出现「可放行 / 修改后放行 / 不建议放行」之一；")
+    n += 1
+    rules.append(f"{n}. 报告里不得出现任何方法论/框架/工具/书籍的名称或代号，不得声称已修改代码。")
+    if tr_cols:
+        rules.append(f"{n + 1}. 「上轮问题跟踪」的列头必须严格为 `{' | '.join(tr_cols)}`；")
+    return "\n".join(rules) + "\n"
+
+
+def _section_lines(md_text: str, title: str) -> list:
+    """取某个章节的内容行（从标题行之后到下一个同级/更高级标题之前）
+
+    没有标题就返回全部行（调用方自己判断要不要报错）。
+    """
+    lines = str(md_text or "").splitlines()
+    start, level = -1, 0
+    for i, ln in enumerate(lines):
+        m = re.match(r"^(#{1,6})\s+(.+?)\s*$", ln)
+        if m and title in m.group(2):
+            start, level = i + 1, len(m.group(1))
+            break
+    if start < 0:
+        return lines
+    for j in range(start, len(lines)):
+        m = re.match(r"^(#{1,6})\s+", lines[j])
+        if m and len(m.group(1)) <= level:
+            return lines[start:j]
+    return lines[start:]
+
+
+def _table_header_of(md_text: str, want: list, title: str = "") -> list:
+    """在某章节里找一张表，返回它的表头（找不到返回空列表）
+
+    只认「表头行 + 分隔行」成对出现的那张表，避免把正文里的竖线当成表头；
+    给了 title 就只在那个章节里找（否则「上轮问题跟踪」和「问题清单」会互相认错）。
+    """
+    lines = _section_lines(md_text, title) if title else str(md_text or "").splitlines()
+    for i, ln in enumerate(lines):
+        if not ln.lstrip().startswith("|"):
+            continue
+        if not any(w in ln for w in want):
+            continue
+        if i + 1 >= len(lines) or not _is_sep_row(lines[i + 1]):
+            continue
+        return _split_md_row(ln)
+    return []
+
+
+def _check_table_columns(md_text: str, section_id: str, title: str) -> list:
+    """校验某张表：表头列名必须与规范一致（不再用「全文包含」这种糊弄法）"""
+    cols = spec_table_columns(section_id)
+    if not cols:
+        return []
+    head = _table_header_of(md_text, [cols[0]], title)
+    if not head:
+        return [f"「{title}」缺少表格（或表头不是 Markdown 表格）"]
+    norm = [c.replace(" ", "") for c in head]
+    want = [c.replace(" ", "") for c in cols]
+    if norm != want:
+        missing = [c for c in want if c not in norm]
+        extra = [c for c in norm if c not in want]
+        detail = []
+        if missing:
+            detail.append("缺少列：" + ", ".join(missing))
+        if extra:
+            detail.append("多出列：" + ", ".join(extra))
+        if not detail:
+            detail.append("列顺序应为：" + " | ".join(cols))
+        return [f"「{title}」表头不对（" + "；".join(detail) + "）"]
+    return []
 
 
 def validate_report(md_text: str, n_files: int = 0, baseline: bool = False) -> list:
@@ -373,24 +475,16 @@ def validate_report(md_text: str, n_files: int = 0, baseline: bool = False) -> l
 
     heads = re.findall(r"^#{1,6}\s+(.+?)\s*$", md_text, re.M)
     head_text = " / ".join(heads)
-    sections = list(REPORT_SPEC.get("sections", []))
-    if baseline:
-        sections += list(REPORT_SPEC.get("sections_when_baseline", []))
-    for s in sections:
+    for s in spec_sections(baseline):
         if not s.get("required"):
             continue
         title = s.get("title", "")
         if title and title not in head_text:
             issues.append(f"缺少必需章节「{title}」")
-    if baseline and "上轮问题跟踪" in head_text:
-        cols = REPORT_SPEC.get("sections_when_baseline") or [{}]
-        need = ["上轮问题", "本轮判定"]
-        for c in (cols[0].get("columns") or []):
-            if c and c not in md_text:
-                need.append(c)
-        missing = [c for c in need if c not in md_text]
-        if missing:
-            issues.append(f"「上轮问题跟踪」表头缺少列：{', '.join(missing)}")
+            continue
+        # 表格章节：解析表头比对列名（不再「全文包含」——散文里提到列名也算过）
+        if s.get("type") == "table":
+            issues.extend(_check_table_columns(md_text, s.get("id", ""), title))
 
     for gc in REPORT_SPEC.get("global_checks", []):
         if gc.get("min_chars"):
@@ -451,7 +545,8 @@ def scrub_report_file(path: Path) -> list:
     """对已生成的报告文件做一次来源擦除；返回被擦的词（空 = 没泄露）"""
     try:
         raw = path.read_text(encoding="utf-8", errors="replace")
-    except Exception:
+    except Exception as e:
+        log(f"报告文件读取失败（无法擦除来源）: {path} ({e})", "WARN")
         return []
     clean, hits = scrub_attribution(raw)
     if hits:
@@ -613,7 +708,9 @@ def load_task(mid: str):
         return None
     try:
         return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
+    except Exception as e:
+        # 任务文件读不出来 = 任务凭空消失，**必须**留下痕迹
+        log(f"任务文件读取失败({e}): {p}", "WARN")
         return None
 
 
@@ -724,11 +821,11 @@ def enqueue(msg: dict) -> str:
     """幂等入队：已 REPLIED/已驳回/待审批 的任务直接跳过；自己发的/回复邮件直接忽略"""
     mid = msg["message_id"]
     t = load_task(mid)
-    if t is not None and t.get("state") == "REPLIED":
+    if t is not None and t.get("state") == State.REPLIED:
         return "DONE_SKIP"
-    if t is not None and t.get("state") in ("REJECTED", "AWAITING_APPROVAL"):
+    if t is not None and t.get("state") in (State.REJECTED, State.AWAITING_APPROVAL):
         return f"DONE_SKIP_{t.get('state')}"
-    if t is not None and t.get("state") == "FAILED" and t.get("attempts", 0) >= CONFIG["max_retries"]:
+    if t is not None and t.get("state") == State.FAILED and t.get("attempts", 0) >= CONFIG["max_retries"]:
         return "FAILED_SKIP"
 
     reason = ignore_reason(msg)
@@ -741,7 +838,7 @@ def enqueue(msg: dict) -> str:
                 "from_name": (msg.get("from") or {}).get("name", ""),
                 "created_at": msg.get("created_at", iso()),
                 "created_at_ts": now(),
-                "state": "IGNORED",
+                "state": State.IGNORED,
                 "ignore_reason": reason,
                 "attempts": 0,
                 "last_error": None,
@@ -760,7 +857,7 @@ def enqueue(msg: dict) -> str:
             "from_name": (msg.get("from") or {}).get("name", ""),
             "created_at": msg.get("created_at", iso()),
             "created_at_ts": now(),
-            "state": "SEEN",
+            "state": State.SEEN,
             "project_key": project_key(msg.get("subject", "")),
             "review_round": round_of(msg.get("subject", "")) or 1,
             "attempts": 0,
@@ -773,15 +870,15 @@ def enqueue(msg: dict) -> str:
         return "NEW"
     # 退避中的失败任务：watch/poll 再次发现时**不能**清零退避，
     # 否则指数退避形同虚设（上游 503 时会变成持续轰炸）。
-    if t.get("state") == "FAILED":
+    if t.get("state") == State.FAILED:
         nra = t.get("next_retry_at", 0) or 0
         if nra and nra > now():
             return "BACKOFF_SKIP"
         if t.get("attempts", 0) >= CONFIG["max_retries"]:
             return "FAILED_SKIP"
 
-    # 状态回退：重新入队
-    t["state"] = "SEEN"
+    # 状态回退：重新入队（FAILED -> SEEN 是合法转移）
+    set_state(t, State.SEEN, "enqueue")
     t["next_retry_at"] = 0
     save_task(t)
     return "REQUEUE"
@@ -1153,7 +1250,7 @@ def find_baseline(task: dict, tasks=None):
         if t.get("message_id") == mid:
             continue
         # 只认真正发出去过的轮次：报告没到发件人手里，就不算「上一轮」
-        if (t.get("state") or "").upper() != "REPLIED":
+        if (t.get("state") or "").upper() != State.REPLIED:
             continue
         tkey = t.get("project_key") or project_key(t.get("subject", ""))
         if tkey != key:
@@ -1602,8 +1699,8 @@ def collect_requirements(task: dict, mail_body: str = "", src_dir: Path = None) 
             if f.is_file():
                 try:
                     add(f.read_text(encoding="utf-8", errors="replace"), f"代码包内文件 {name}")
-                except Exception:
-                    pass
+                except Exception as e:
+                    log(f"代码包内要求文件读取失败({e}): {f}", "WARN")
                 break
 
     if mail_body:
@@ -1808,13 +1905,8 @@ REVIEW_PROMPT_HTTP_MERGE = """你是资深代码审查工程师的**总审**。�
 - 只给建议，**不要声称已修改代码**。
 """
 
-FIX_RULES = (
-    "要求：\n"
-    "1. 保留原有分析内容（不要重写、不要丢失已发现的问题）；\n"
-    "2. 补齐缺失章节，章节标题逐字使用规范中的标题；\n"
-    "3. 问题清单的列头必须严格为 `编号 | 级别 | 文件:行号 | 问题描述 | 成因 | 后果 | 修改建议`；\n"
-    "4. 结论中必须出现「可放行 / 修改后放行 / 不建议放行」之一；\n"
-    "5. 报告里不得出现任何方法论/框架/工具/书籍的名称或代号，不得声称已修改代码。\n")
+# 「请修订报告」的硬性规则由 fix_rules_text() 从模板生成
+# （列名不再手写第二份——改 templates/report_sections.json 即改这里）
 
 
 def _provider() -> "LLM.Provider":
@@ -1920,7 +2012,7 @@ def _fix_prompt(issues: list, baseline: dict, *, file_mode: bool, old_text: str 
     """
     head = ("你上一轮生成的代码审核报告**未通过结构校验**，"
             "请修订后输出**完整报告全文**。\n"
-            "校验不通过的原因：\n" + "\n".join(f"- {x}" for x in issues) + "\n\n" + FIX_RULES)
+            "校验不通过的原因：\n" + "\n".join(f"- {x}" for x in issues) + "\n\n" + fix_rules_text())
     if file_mode:
         tail = ("6. 只改写报告文件，不要改动代码包内的任何文件；"
                 "不要把报告正文输出到标准输出。\n")
@@ -2290,6 +2382,11 @@ def run_review(task, extra: str = "", baseline: dict = None) -> Path:
             f"{baseline['total']} 条旧问题待核对")
 
     warnings = []
+    # 方法论读不到时**不能静默**：它会让报告质量下降，而且事后无从归因
+    if not load_methodology(full=True):
+        warnings.append("本次未加载审查方法论（templates/methodology.md 不可读），"
+                        "审核覆盖面可能不完整")
+        log(f"[{mid}] 审查方法论不可用，已记入报告注意事项", "WARN")
     backend = llm_backend()
     if backend == "http":
         md, fix = _review_via_http(mid, src, rpt, files, extra, warnings, baseline=baseline)
@@ -2418,8 +2515,68 @@ def send_reply(task, report_dir: Path):
 
 
 # ---------------------------------------------------------------- 审批
-TERMINAL_STATES = ("REPLIED", "REJECTED", "IGNORED")
-WORKING_STATES = ("SEEN", "DOWNLOADED", "REVIEWED", "AWAITING_APPROVAL", "FAILED")
+# 任务状态：单一事实源（以前是散落 37 处的裸字符串，非法转移没人拦得住）
+class State:
+    SEEN = "SEEN"                      # 已入队
+    DOWNLOADED = "DOWNLOADED"          # 附件已下载解压
+    REVIEWED = "REVIEWED"              # 报告已生成
+    AWAITING_APPROVAL = "AWAITING_APPROVAL"   # 等人工审批
+    REPLIED = "REPLIED"                # 已回信
+    REJECTED = "REJECTED"              # 审批驳回
+    IGNORED = "IGNORED"                # 不该处理（回复线程等）
+    FAILED = "FAILED"                  # 失败，待退避重试
+
+    ALL = (SEEN, DOWNLOADED, REVIEWED, AWAITING_APPROVAL,
+           REPLIED, REJECTED, IGNORED, FAILED)
+
+
+TERMINAL_STATES = (State.REPLIED, State.REJECTED, State.IGNORED)
+WORKING_STATES = (State.SEEN, State.DOWNLOADED, State.REVIEWED,
+                  State.AWAITING_APPROVAL, State.FAILED)
+
+# 合法状态转移表：写错状态会在这里被拦住（而不是悄悄写成非法状态）
+ALLOWED_TRANSITIONS = {
+    # SEEN 也可以直接到 REPLIED：附件缺失/解压失败等异常分支会当场回信
+    State.SEEN: {State.DOWNLOADED, State.REPLIED, State.FAILED, State.IGNORED},
+    State.DOWNLOADED: {State.REVIEWED, State.REPLIED, State.FAILED, State.IGNORED},
+    State.REVIEWED: {State.AWAITING_APPROVAL, State.REPLIED, State.FAILED},
+    State.AWAITING_APPROVAL: {State.REPLIED, State.REJECTED, State.FAILED},
+    State.FAILED: {State.SEEN, State.REPLIED},     # SEEN=重试，REPLIED=失败通知已发
+    State.REPLIED: set(),
+    State.REJECTED: set(),
+    State.IGNORED: set(),
+}
+
+
+def valid_state(s) -> bool:
+    return s in State.ALL
+
+
+def can_transition(old: str, new: str) -> bool:
+    """这个转移合不合法（未知旧状态一律放行，不因为历史脏数据卡住任务）"""
+    if old == new:
+        return True
+    if old not in ALLOWED_TRANSITIONS:
+        return True
+    return new in ALLOWED_TRANSITIONS[old]
+
+
+def set_state(task: dict, new: str, where: str = "") -> str:
+    """唯一的写状态入口：校验合法性，非法就记 WARN 并保持原状态
+
+    返回真正写入的状态（非法时返回原状态）。
+    """
+    old = task.get("state") or ""
+    if old == new:
+        return old
+    if not valid_state(new):
+        log(f"[{task.get('message_id')}] 非法状态值 {new!r}（{where}），保持 {old}", "WARN")
+        return old
+    if not can_transition(old, new):
+        log(f"[{task.get('message_id')}] 非法状态转移 {old} -> {new}（{where}），已拒绝", "WARN")
+        return old
+    task["state"] = new
+    return new
 
 
 def require_approval() -> bool:
@@ -2431,7 +2588,7 @@ def approve_task(mid: str, approver: str = "") -> dict:
     t = load_task(mid)
     if t is None:
         raise RuntimeError("任务不存在")
-    if t.get("state") not in ("AWAITING_APPROVAL", "REVIEWED"):
+    if t.get("state") not in (State.AWAITING_APPROVAL, State.REVIEWED):
         raise RuntimeError(f"当前状态 {t.get('state')} 不能审批通过（需处于待审批/已审核）")
     rpt = Path(t.get("report") or (WORK / mid / "report"))
     if not rpt.exists():
@@ -2439,7 +2596,7 @@ def approve_task(mid: str, approver: str = "") -> dict:
     send_reply(t, rpt)
     # 发报告是网络调用（秒级），期间任务可能被旁路改过：只叠加本函数的字段
     def _mark_approved(x):
-        x["state"] = "REPLIED"
+        x["state"] = State.REPLIED
         x["replied_at"] = iso()
         x["approved_at"] = iso()
         if approver:
@@ -2456,9 +2613,9 @@ def reject_task(mid: str, reason: str = "") -> dict:
     t = load_task(mid)
     if t is None:
         raise RuntimeError("任务不存在")
-    if t.get("state") not in ("AWAITING_APPROVAL", "REVIEWED"):
+    if t.get("state") not in (State.AWAITING_APPROVAL, State.REVIEWED):
         raise RuntimeError(f"当前状态 {t.get('state')} 不能驳回（需处于待审批/已审核）")
-    t["state"] = "REJECTED"
+    set_state(t, State.REJECTED, "reject_task")
     t["rejected_at"] = iso()
     if reason:
         t["reject_reason"] = reason[:1000]
@@ -2471,11 +2628,11 @@ def reject_task(mid: str, reason: str = "") -> dict:
 def eta_hint(task) -> str:
     """给发件人的预计完成时间（粗略，避免过度承诺）"""
     state = (task.get("state") or "").upper()
-    if state == "AWAITING_APPROVAL":
+    if state == State.AWAITING_APPROVAL:
         return "取决于审批人处理时间，通常几分钟到几十分钟内"
-    if state in ("REVIEWED", "DOWNLOADED"):
+    if state in (State.REVIEWED, State.DOWNLOADED):
         return "约 5~20 分钟内（取决于代码规模与模型响应）"
-    if state == "FAILED":
+    if state == State.FAILED:
         return "自动重试间隔 5~15 分钟，视模型服务恢复情况而定"
     return "约 5~30 分钟内（视队列长度与代码规模）"
 
@@ -2506,7 +2663,7 @@ def ack_sweep() -> int:
         state = (t.get("state") or "").upper()
         if state in TERMINAL_STATES or state == "":
             continue
-        if state == "FAILED" and t.get("attempts", 0) >= CONFIG["max_retries"]:
+        if state == State.FAILED and t.get("attempts", 0) >= CONFIG["max_retries"]:
             continue
         if ack_sent_at(t["message_id"]):
             continue
@@ -2614,7 +2771,7 @@ def process_task(mid: str) -> str:
         t = load_task(mid)
         if t is None:
             raise RuntimeError("任务不存在")
-        if t.get("state") == "REPLIED":
+        if t.get("state") == State.REPLIED:
             log(f"[{mid}] 已回复，跳过")
             return "SKIP_REPLIED"
 
@@ -2717,7 +2874,7 @@ def process_task(mid: str) -> str:
         if not saved and link_only:
             body = ANOMALY.reply_link_only(subj, link_only)
             do_reply(mid, body, [])
-            t["state"] = "REPLIED"
+            set_state(t, State.REPLIED, "直链取不回/回信")
             t["replied_at"] = iso()
             t["last_error"] = "附件仅提供直链且无法取回: " + "; ".join(
                 f"{n}({ANOMALY.human_size(s)})：{e or '未知原因'}"
@@ -2727,7 +2884,7 @@ def process_task(mid: str) -> str:
         if not saved and dl_failed:
             body = ANOMALY.reply_download_failed(subj, dl_failed)
             do_reply(mid, body, [])
-            t["state"] = "REPLIED"
+            set_state(t, State.REPLIED, "下载失败/回信")
             t["replied_at"] = iso()
             t["last_error"] = "附件下载失败: " + "; ".join(f"{n}: {e}" for n, e in dl_failed)
             save_task(t)
@@ -2735,12 +2892,12 @@ def process_task(mid: str) -> str:
         if not saved:
             body = ANOMALY.reply_no_attachment(subj)
             do_reply(mid, body, [])
-            t["state"] = "REPLIED"
+            set_state(t, State.REPLIED, "无附件回信")
             t["replied_at"] = iso()
             save_task(t)
             return "REPLIED_NO_ATTACH"
 
-        t["state"] = "DOWNLOADED"
+        set_state(t, State.DOWNLOADED, "process_task")
         save_task(t)
 
         # 5. AI 审核
@@ -2773,19 +2930,19 @@ def process_task(mid: str) -> str:
                 body = ANOMALY.reply_no_source(subj)
                 t["last_error"] = "附件中无可审核源码"
             do_reply(mid, body, [])
-            t["state"] = "REPLIED"
+            set_state(t, State.REPLIED, "无源码回信")
             t["replied_at"] = iso()
             save_task(t)
             return "REPLIED_NO_SOURCE"
 
         rpt = run_review(t, extra, baseline)
-        t["state"] = "REVIEWED"
+        set_state(t, State.REVIEWED, "process_task")
         t["report"] = str(rpt)
         save_task(t)
 
         # 6. 审批闸：开了审批就停下等人批，不自动发
         if require_approval():
-            t["state"] = "AWAITING_APPROVAL"
+            set_state(t, State.AWAITING_APPROVAL, "process_task/审批闸")
             t["awaiting_since"] = iso()
             save_task(t)
             log(f"[{mid}] 审核完成，等待人工审批（require_approval 已开启）")
@@ -2793,7 +2950,7 @@ def process_task(mid: str) -> str:
 
         # 未开审批 -> 直接回复（带报告附件）
         send_reply(t, rpt)
-        t["state"] = "REPLIED"
+        set_state(t, State.REPLIED, "process_task/回信")
         t["replied_at"] = iso()
         t["last_error"] = None
         save_task(t)
@@ -2833,9 +2990,9 @@ def next_task():
         nra = t.get("next_retry_at", 0) or 0
         if nra and nra > now():
             continue
-        if t.get("state") in ("SEEN", "DOWNLOADED", "REVIEWED"):
+        if t.get("state") in (State.SEEN, State.DOWNLOADED, State.REVIEWED):
             return t
-        if t.get("state") == "FAILED" and t.get("attempts", 0) < retries:
+        if t.get("state") == State.FAILED and t.get("attempts", 0) < retries:
             return t
     return None
 
@@ -2845,7 +3002,7 @@ def mark_failed(cand: dict, err: Exception) -> dict:
     mid = cand["message_id"]
     log(f"任务 {mid} 失败: {err}", "ERROR")
     t = load_task(mid) or cand
-    t["state"] = "FAILED"
+    set_state(t, State.FAILED, "mark_failed")
     t["last_error"] = str(err)[:2000]
     back = CONFIG.get("retry_backoff_sec", 300) * (2 ** max(0, t.get("attempts", 1) - 1))
     # 上游模型繁忙时退避得更久（过载不会 5 分钟就恢复）
@@ -2860,7 +3017,7 @@ def mark_failed(cand: dict, err: Exception) -> dict:
             body = ANOMALY.reply_review_failed(
                 t.get("subject", ""), str(err), t.get("attempts", 0))
             do_reply(mid, body, [])
-            t["state"] = "REPLIED"
+            set_state(t, State.REPLIED, "失败通知已发")
             t["replied_at"] = iso()
             t["notify_sent_at"] = iso()
             save_task(t)
@@ -2875,7 +3032,7 @@ def process_candidate(cand: dict) -> None:
     mid = cand["message_id"]
     reason = ignore_reason(cand)
     if reason:
-        cand["state"] = "IGNORED"
+        set_state(cand, State.IGNORED, "process_candidate")
         cand["ignore_reason"] = reason
         save_task(cand)
         log(f"任务 {mid} 标记为 IGNORED ({reason})")
@@ -3095,8 +3252,7 @@ def status():
     for t in tasks:
         buckets.setdefault(t.get("state"), []).append(t)
     print(f"\n任务总数: {len(tasks)}")
-    for st in ("SEEN", "DOWNLOADED", "REVIEWED", "AWAITING_APPROVAL", "REPLIED",
-               "REJECTED", "FAILED", "IGNORED"):
+    for st in State.ALL:
         arr = buckets.get(st, [])
         if not arr:
             continue
@@ -3454,8 +3610,8 @@ def effective_model_desc() -> str:
                            .read_text(encoding="utf-8"))
             desc += (f" {s.get('defaultProvider') or '?'}/{s.get('defaultModel') or '?'}"
                      f"（thinking={s.get('defaultThinkingLevel') or '?'}）")
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"读取 pi 设置失败（仅影响状态展示）: {e}", "WARN")
     if CONFIG.get("pi_thinking"):
         desc += f"（thinking={CONFIG['pi_thinking']}）"
     if st["fallback_model"]:
@@ -3743,7 +3899,7 @@ def main():
     elif cmd == "retry":
         t = load_task(a.id)
         if t:
-            t["state"] = "SEEN"
+            set_state(t, State.SEEN, "retry")
             t["attempts"] = 0
             t["next_retry_at"] = 0
             t["last_error"] = None
