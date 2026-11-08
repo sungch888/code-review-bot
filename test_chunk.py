@@ -57,7 +57,7 @@ fl = "\n".join(f"- {f.relative_to('/x').as_posix()}"
                for f in [F("/x/src/a.py"), F("/x/src/b.py")])
 check("文件清单用相对路径", "- src/a.py" in fl, fl)
 cp = B.REVIEW_PROMPT_CHUNK.format(src="/x/src", rpt="/x/rpt", extra="", idx=2, total=3,
-                                  filelist=fl, sections=B.spec_sections_text())
+                                  baseline="", filelist=fl, sections=B.spec_sections_text())
 check("分块提示词含批次序号", "第 2/3 批" in cp, "")
 check("分块提示词含文件清单", "- src/a.py" in cp and "- src/b.py" in cp, "")
 check("分块提示词要求逐字用章节标题", "逐字使用" in cp, "")
@@ -66,12 +66,13 @@ check("分块提示词要求写 chunk 文件", "chunk_2_报告.md" in cp, "")
 check("分块提示词注入的 extra 生效", cp.count("附加要求") == 0, "空 extra 不应出现附加要求块")
 
 cp2 = B.REVIEW_PROMPT_CHUNK.format(src="/x/src", rpt="/x/rpt", extra="## 附加要求\n关注并发",
-                                   idx=1, total=1, filelist=fl, sections=B.spec_sections_text())
+                                   idx=1, total=1, baseline="",
+                                   filelist=fl, sections=B.spec_sections_text())
 check("分块提示词带上了额外要求", "关注并发" in cp2, "")
 
 # 3. 合并提示词
 mp = B.REVIEW_PROMPT_MERGE.format(src="/x/src", rpt="/x/rpt",
-                                  chunks_path="/x/rpt/_all_chunks.md",
+                                  chunks_path="/x/rpt/_all_chunks.md", baseline="",
                                   sections=B.spec_sections_text())
 check("合并提示词给出分批报告文件路径", "_all_chunks.md" in mp, "")
 check("合并提示词要求先 read 该文件", "read 工具" in mp, "")

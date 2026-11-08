@@ -51,8 +51,9 @@ txt = bot.spec_sections_text()
 check("规范渲染出全部章节标题",
       all(s["title"] in txt for s in bot.REPORT_SPEC["sections"]),
       txt[:200])
-check("提示词可 format（四占位符）",
+check("提示词可 format（五占位符）",
       "{" not in bot.REVIEW_PROMPT.format(src="S", rpt="R", extra="", sections=txt,
+                                          baseline="",
                                           methodology=bot.load_methodology(True)).replace("{src}", "").replace("{rpt}", ""),
       "存在未替换花括号")
 

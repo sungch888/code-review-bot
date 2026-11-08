@@ -686,6 +686,24 @@ def page_task(mid: str, flash: str = "", err: bool = False) -> str:
     warns = t.get("report_warnings") or []
     warn_html = ("".join(f'<div class="flash err">{esc(w)}</div>' for w in warns)) if warns else ""
 
+    # 多轮闭环：项目 / 轮次 / 基线
+    id_rows = (f'<div class="k">项目</div><div>{esc(t.get("project_key") or "-")}</div>'
+               f'<div class="k">轮次</div><div>第 {esc(t.get("review_round") or 1)} 轮</div>')
+    if t.get("baseline_mid"):
+        id_rows += (f'<div class="k">回归核对</div><div class="mono">基线 '
+                    f'{esc(str(t.get("baseline_mid")))}（第 {esc(t.get("baseline_round") or 1)} 轮，'
+                    f'{esc(t.get("baseline_issue_count") or 0)} 条旧问题）</div>')
+    tr = t.get("tracking") or {}
+    track_html = ""
+    if tr.get("total"):
+        pend = "".join(f'<div class="sub">[{esc(i.get("level"))}] {esc(i.get("desc"))}</div>'
+                        for i in (tr.get("unfixed_items") or [])[:10])
+        pend_block = (f'<div style="margin-top:10px"><b>仍未修复 / 未修完</b>{pend}</div>'
+                      if pend else "")
+        track_html = (f'\n<div class="card">\n  <h2>上轮问题跟踪</h2>\n'
+                      f'  <div class="hint">{esc(B.tracking_line(tr, t.get("new_issues") or 0))}</div>\n'
+                      f'  {pend_block}\n</div>')
+
     pi_log = B.LOGS / f"{mid}.pi.log"
     log_txt = ""
     if pi_log.exists():
@@ -756,6 +774,7 @@ def page_task(mid: str, flash: str = "", err: bool = False) -> str:
     <div class="k">状态</div><div>{badge(t.get('state'))}</div>
     <div class="k">发件人</div><div>{esc(t.get('from_name'))} &lt;{esc(t.get('from'))}&gt;</div>
     <div class="k">时间</div><div>{fmt_time(t.get('created_at'))}</div>
+    {id_rows}
     <div class="k">尝试次数</div><div>{esc(t.get('attempts', 0))}</div>
     <div class="k">已回复</div><div>{fmt_time(t.get('replied_at'))}</div>
     {ack_line}
@@ -789,6 +808,7 @@ def page_task(mid: str, flash: str = "", err: bool = False) -> str:
   {''.join(files) or '<tr><td colspan="3" class="sub">暂无报告</td></tr>'}
   </tbody></table>
 </div>
+{track_html}
 
 <div class="card">
   <h2>AI 审核日志（尾部）</h2>
@@ -1159,12 +1179,15 @@ class Handler(BaseHTTPRequestHandler):
 
     # --- POST ---
     def do_POST(self):
-        if not self._host_ok():
-            return self._send(403, "forbidden host", "text/plain; charset=utf-8")
+        # 先读掉请求体再判定：先回 403 再关连接时，客户端可能还在发 body，
+        # 半关的连接会抛 WinError 10053（测试偶发、真实浏览器也可能撞到）。
         n = int(self.headers.get("Content-Length") or 0)
         if n > 1_000_000:
+            self.close_connection = True
             return self._send(413, "payload too large", "text/plain; charset=utf-8")
-        raw = self.rfile.read(n).decode("utf-8", "replace")
+        raw = self.rfile.read(n).decode("utf-8", "replace") if n > 0 else ""
+        if not self._host_ok():
+            return self._send(403, "forbidden host", "text/plain; charset=utf-8")
         form = urllib.parse.parse_qs(raw, keep_blank_values=True)
 
         if (form.get("csrf") or [""])[0] != CSI:

@@ -98,6 +98,15 @@ def main():
             {"source": "邮件正文【审核要求】", "text": "1. 关注 <script>alert(3)</script>"}
         ],
         "report_warnings": ["警告 <script>alert(4)</script>"],
+        "project_key": "demo order",
+        "review_round": 2,
+        "baseline_mid": "msg_base<script>x",
+        "baseline_round": 1,
+        "baseline_issue_count": 3,
+        "new_issues": 2,
+        "tracking": {"total": 3, "fixed": 1, "partial": 0, "unfixed": 2, "unknown": 0,
+                     "unfixed_items": [
+                         {"level": "高危", "desc": "旧问题 <script>alert(5)</script>"}]},
     }
     B.save_task(task)
     rdir = B.WORK / xss_mid / "report"
@@ -139,6 +148,13 @@ def main():
               "boom&lt;script&gt;" in body or "<script>alert(2)" not in body, "")
         check("详情页要求区块已转义",
               "&lt;script&gt;" in body or "<script>alert(3)" not in body, "")
+
+        # 多轮闭环：轮次 / 回归基线 / 闭环数字（也都要转义）
+        check("详情页显示轮次", "第 2 轮" in body, "")
+        check("详情页显示回归基线", "回归核对" in body and "第 1 轮" in body, "")
+        check("详情页显示上轮问题跟踪", "上轮问题跟踪" in body and "已修复 1" in body, "")
+        check("详情页闭环清单已转义", "&lt;script&gt;alert(5)" in body
+              and "<script>alert(5)" not in body, "")
 
         # 详情页的「重跑/立即处理」按钮必须带上任务 id（否则提交空 id -> 空 /task/ 页）
         import re as _re

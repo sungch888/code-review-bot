@@ -89,5 +89,7 @@
   "provider_busy_backoff_sec": 900,
   "require_approval": false,
   "ack_enabled": true,
-  "ack_timeout_sec": 300
+  "ack_timeout_sec": 300,
+  "regression_review": true,
+  "regression_max_issues": 80
 }

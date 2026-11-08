@@ -65,7 +65,7 @@ def main():
     def rendered(tpl, **kw):
         base = dict(src="S", rpt="R", extra="", sections="SEC", count=1,
                     idx=1, total=2, file_count=1, chunk_reports="CH",
-                    files_content="FC", filelist="FL", methodology=meth)
+                    files_content="FC", filelist="FL", baseline="", methodology=meth)
         base.update(kw)
         return tpl.format(**base)
 
