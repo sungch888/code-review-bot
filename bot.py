@@ -28,6 +28,7 @@ import signal
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 import zipfile
 from datetime import datetime, timezone
@@ -126,6 +127,160 @@ def reload_config() -> None:
         CONFIG.update(fresh)
         KEYWORD = fresh.get("subject_keyword", KEYWORD)
         log("配置已重载")
+
+# ---------------------------------------------------------------- 并发与限速
+# 并发是两层：
+#   1) 任务级：多个 worker 同时处理不同任务（max_workers）
+#   2) 分块级：同一个大包的多个分块并行审（chunk_workers）
+# 两层最终都落到「同时打几个模型请求」上，所以统一由一个闸控制：
+#   - 信号量限并发（llm_max_concurrency）
+#   - 任意一路收到 429/503，全局冷却一段时间（llm_rate_cooldown_sec），
+#     让后续请求一起让路，而不是各自碰壁、互相把上游打死
+_LOCK_CLAIM = threading.Lock()
+_CLAIMED = {}                 # mid -> 开始时间（进程内抢占，防两个 worker 拿同一个任务）
+_LAST_SCAN = [0.0]
+_LOCK_SCAN = threading.Lock()
+_LAST_RELOAD = [0.0]
+_LOCK_RELOAD = threading.Lock()
+
+
+class RateGate:
+    """全局模型调用闸：限并发 + 上游繁忙时联动冷却"""
+
+    def __init__(self, max_concurrent: int = 2):
+        self.limit = max(1, int(max_concurrent or 1))
+        self._sem = threading.BoundedSemaphore(self.limit)
+        self._lock = threading.Lock()
+        self.until = 0.0
+        self.cool_count = 0
+
+    def wait_turn(self, timeout: float = 900.0) -> bool:
+        """排队拿一个调用名额；冷却期内先等（超时则放行，不无限卡死）"""
+        deadline = now() + timeout
+        while True:
+            with self._lock:
+                delay = self.until - now()
+            if delay > 0:
+                if now() > deadline:
+                    return False
+                time.sleep(min(delay, 3))
+                continue
+            if self._sem.acquire(timeout=max(1.0, deadline - now())):
+                return True
+            return False
+
+    def release(self) -> None:
+        try:
+            self._sem.release()
+        except ValueError:
+            pass
+
+    def cool_down(self, seconds: float, why: str = "") -> None:
+        """上游限流/过载：所有并发路径一起让路，避免继续撞"""
+        with self._lock:
+            until = now() + max(0.0, seconds)
+            if until > self.until:
+                self.until = until
+                self.cool_count += 1
+                if why:
+                    log(f"上游繁忙，全局冷却 {seconds:.0f}s（{why}）", "WARN")
+
+    def busy_for(self) -> float:
+        with self._lock:
+            return max(0.0, self.until - now())
+
+    def resize(self, n: int) -> None:
+        n = max(1, int(n or 1))
+        if n == self.limit:
+            return
+        self._sem = threading.BoundedSemaphore(n)
+        self.limit = n
+
+
+_GATE = None
+
+
+def rate_gate() -> RateGate:
+    """按当前配置取限速闸（配置改了即时生效，不用重启）"""
+    global _GATE
+    limit = int(CONFIG.get("llm_max_concurrency", 2) or 2)
+    if _GATE is None:
+        _GATE = RateGate(limit)
+    else:
+        _GATE.resize(limit)
+    return _GATE
+
+
+def rate_cooldown() -> float:
+    try:
+        return float(CONFIG.get("llm_rate_cooldown_sec", 20) or 20)
+    except (TypeError, ValueError):
+        return 20.0
+
+
+def effective_workers() -> int:
+    try:
+        return max(1, int(CONFIG.get("max_workers", 1) or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+def effective_chunk_workers(n_items: int) -> int:
+    """同一任务内并行审几块：受 chunk_workers 与模型并发上限双重约束"""
+    try:
+        want = int(CONFIG.get("chunk_workers", 2) or 1)
+    except (TypeError, ValueError):
+        want = 1
+    try:
+        cap = int(CONFIG.get("llm_max_concurrency", 2) or 1)
+    except (TypeError, ValueError):
+        cap = 1
+    return max(1, min(want, cap, max(1, n_items)))
+
+
+def run_parallel(items, fn, workers: int = 1):
+    """执行一批独立子任务，**按传入顺序**返回结果
+
+    workers<=1 时就是普通循环（行为与改造前完全一致）。
+    任一子任务抛错：不再启动新的，并把错误抛出去（任务级失败/重试逻辑在下游）。
+    """
+    items = list(items)
+    if not items:
+        return []
+    if workers <= 1 or len(items) == 1:
+        return [fn(i, x) for i, x in enumerate(items)]
+    from concurrent.futures import ThreadPoolExecutor
+    out = [None] * len(items)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(fn, i, x): i for i, x in enumerate(items)}
+        try:
+            for f, i in list(futs.items()):
+                out[i] = f.result()
+        except Exception:
+            for f in futs:
+                f.cancel()
+            raise
+    return out
+
+
+def claim_task(mid: str) -> bool:
+    """进程内抢占：两个 worker 不能同时拿同一个任务"""
+    with _LOCK_CLAIM:
+        if mid in _CLAIMED:
+            return False
+        _CLAIMED[mid] = now()
+        return True
+
+
+def release_task(mid: str) -> None:
+    with _LOCK_CLAIM:
+        _CLAIMED.pop(mid, None)
+
+
+def claimed_tasks() -> set:
+    with _LOCK_CLAIM:
+        return set(_CLAIMED)
+
 
 # ---------------------------------------------------------------- 报告规范
 SPEC_PATH = BASE / "templates" / "report_sections.json"
@@ -1679,24 +1834,44 @@ def _review_via_http(mid: str, src: Path, rpt: Path, files, extra: str, warnings
     max_file_chars = int(CONFIG.get("max_file_chars", 30000) or 0)
     fb = (CONFIG.get("fallback_model") or "").strip()
 
-    def call(messages, tag, max_tokens=0):
-        """一次调用；上游繁忙时自动换 fallback_model 再试一次"""
-        log(f"[{mid}] 调用模型 ({tag}) model={prov.model} ...")
+    def _chat(messages, model: str = "", max_tokens=0):
+        """受全局闸约束的一次调用（限额 + 排队）"""
+        gate = rate_gate()
+        gate.wait_turn()
         try:
-            r = prov.chat(messages, max_tokens=max_tokens)
-        except LLM.ProviderBusy as e:
-            if fb and fb != prov.model:
-                log(f"[{mid}] 上游繁忙({e})，切换备用模型 {fb} 重试", "WARN")
-                try:
-                    r = prov.chat(messages, model=fb, max_tokens=max_tokens)
-                    warnings.append(f"上游 {prov.model} 繁忙，本次已自动切换到 {fb}")
-                except LLM.LLMError as e2:
-                    raise RuntimeError(f"模型调用失败({tag}): {e2}")
-            else:
+            return prov.chat(messages, model=model, max_tokens=max_tokens)
+        finally:
+            gate.release()
+
+    def call(messages, tag, max_tokens=0):
+        """一次调用：并发闸 + 限流冷却后重试一次 + 兜底换 fallback_model
+
+        并发跑多个任务/分块时，上游 429 是常态而不是异常；
+        所以先全局冷却再试一次，而不是直接把这个任务判失败。
+        """
+        log(f"[{mid}] 调用模型 ({tag}) model={prov.model} ...")
+        gate = rate_gate()
+        for attempt in (1, 2):
+            try:
+                r = _chat(messages, max_tokens=max_tokens)
+                break
+            except LLM.ProviderBusy as e:
+                gate.cool_down(rate_cooldown(), f"{tag}: {str(e)[:80]}")
+                if attempt == 1:
+                    log(f"[{mid}] 上游繁忙({e})，冷却后重试一次", "WARN")
+                    continue
+                if fb and fb != prov.model:
+                    log(f"[{mid}] 上游繁忙({e})，切换备用模型 {fb} 重试", "WARN")
+                    try:
+                        r = _chat(messages, model=fb, max_tokens=max_tokens)
+                        warnings.append(f"上游 {prov.model} 繁忙，本次已自动切换到 {fb}")
+                        break
+                    except LLM.LLMError as e2:
+                        raise RuntimeError(f"模型调用失败({tag}): {e2}")
                 raise RuntimeError(f"上游模型繁忙：{e}"
                                    "（不是代码问题；可配 fallback_model 或稍后自动重试）")
-        except LLM.LLMError as e:
-            raise RuntimeError(f"模型调用失败({tag}): {e}")
+            except LLM.LLMError as e:
+                raise RuntimeError(f"模型调用失败({tag}): {e}")
         log(f"[{mid}] {tag}: 返回 {len(r.text)} 字符 / {r.elapsed:.1f}s / "
             f"finish={r.finish_reason or '-'}")
         return r
@@ -1738,10 +1913,14 @@ def _review_via_http(mid: str, src: Path, rpt: Path, files, extra: str, warnings
     if len(batches) > 1:
         chunk_paths = []
         # 上轮问题按「文件落在哪一批」分派给各批自行核对，汇总时不再让模型凭空推理
-        per_batch, missing = assign_baseline(baseline["items"], batches, src) \
-            if baseline else ([], [])
+        if baseline:
+            per_batch, missing = assign_baseline(baseline["items"], batches, src)
+        else:
+            # 没有基线时也得给每批一个空清单，否则下面 per_batch[i-1] 会越界
+            per_batch, missing = [[] for _ in batches], []
         bl = dict(baseline or {})
         bl["missing"] = missing
+        todo = []
         for i, b in enumerate(batches, 1):
             cp = rpt / f"chunk_{i}_报告.md"
             chunk_paths.append(cp)
@@ -1753,6 +1932,10 @@ def _review_via_http(mid: str, src: Path, rpt: Path, files, extra: str, warnings
                     log(f"[{mid}] 复用已有分块报告 {cp.name}")
                     continue
                 log(f"[{mid}] 分块报告 {cp.name} 没有上一轮问题的核对结果，重新生成", "WARN")
+            todo.append((i, b, cp))
+
+        def do_chunk(_idx, item):
+            i, b, cp = item
             prompt = REVIEW_PROMPT_HTTP_CHUNK.format(
                 src=str(src), idx=i, total=len(batches), extra=extra or "",
                 sections=sections, count=len(b),
@@ -1761,6 +1944,13 @@ def _review_via_http(mid: str, src: Path, rpt: Path, files, extra: str, warnings
                 files_content=file_payload(b, src, max_file_chars))
             cp.write_text(complete(prompt, f"第{i}/{len(batches)}批"), encoding="utf-8")
             log(f"[{mid}] 第{i}/{len(batches)}批完成: {cp.stat().st_size} bytes")
+            return cp
+
+        # 分块之间互不依赖 -> 并行审；实际并发还受 llm_max_concurrency 限制
+        workers = effective_chunk_workers(len(todo))
+        if todo and workers > 1:
+            log(f"[{mid}] {len(todo)} 个待生成分块 -> 并行 {workers} 路")
+        run_parallel(todo, do_chunk, workers)
         all_chunks = "\n\n".join(
             f"### 第{i + 1}批（{p.name}）\n" +
             p.read_text(encoding="utf-8", errors="replace")
@@ -1867,8 +2057,10 @@ def _review_via_pi(mid: str, src: Path, rpt: Path, files, extra: str, warnings: 
     busy = False
     if chunks:
         chunk_paths = []
-        per_batch, missing = assign_baseline(baseline["items"], chunks, src) \
-            if baseline else ([], [])
+        if baseline:
+            per_batch, missing = assign_baseline(baseline["items"], chunks, src)
+        else:
+            per_batch, missing = [[] for _ in chunks], []
         bl = dict(baseline or {})
         bl["missing"] = missing
         for i, chunk in enumerate(chunks, 1):
@@ -2467,71 +2659,115 @@ def process_task(mid: str) -> str:
         return "REPLIED"
 
 
+def _maybe_reload() -> None:
+    """重载配置（多 worker 共享节流：最多 3 秒一次，别让 N 个线程刷盘）"""
+    with _LOCK_RELOAD:
+        if now() - _LAST_RELOAD[0] < 3:
+            return
+        _LAST_RELOAD[0] = now()
+        reload_config()
+
+
+def _maybe_scan() -> None:
+    """扫描收件箱（多个 worker 只允许一个扫，避免重复入队/重复发确认信）"""
+    with _LOCK_SCAN:
+        interval = CONFIG.get("poll_interval_sec", 180)
+        if now() - _LAST_SCAN[0] < interval:
+            return
+        _LAST_SCAN[0] = now()
+    try:
+        scan_once()
+    except Exception as e:
+        log(f"扫描失败（下一轮重试）: {e}", "WARN")
+
+
+def next_task():
+    """取最老的待处理任务；已被其他 worker 抢走的跳过"""
+    busy = claimed_tasks()
+    retries = CONFIG.get("max_retries", 3)
+    for t in all_tasks():
+        mid = t.get("message_id")
+        if not mid or mid in busy:
+            continue
+        nra = t.get("next_retry_at", 0) or 0
+        if nra and nra > now():
+            continue
+        if t.get("state") in ("SEEN", "DOWNLOADED", "REVIEWED"):
+            return t
+        if t.get("state") == "FAILED" and t.get("attempts", 0) < retries:
+            return t
+    return None
+
+
+def mark_failed(cand: dict, err: Exception) -> dict:
+    """任务失败：记状态 + 指数退避；重试用尽则回信告知发件人（不能石沉大海）"""
+    mid = cand["message_id"]
+    log(f"任务 {mid} 失败: {err}", "ERROR")
+    t = load_task(mid) or cand
+    t["state"] = "FAILED"
+    t["last_error"] = str(err)[:2000]
+    back = CONFIG.get("retry_backoff_sec", 300) * (2 ** max(0, t.get("attempts", 1) - 1))
+    # 上游模型繁忙时退避得更久（过载不会 5 分钟就恢复）
+    if is_provider_busy(str(err)):
+        back = max(back, CONFIG.get("provider_busy_backoff_sec", 900))
+        log(f"{mid} 判定为上游模型繁忙，退避延长到 {back}s", "WARN")
+    t["next_retry_at"] = now() + back
+    save_task(t)
+    log(f"任务 {mid} 将在 {back}s 后重试")
+    if t.get("attempts", 0) >= CONFIG.get("max_retries", 3):
+        try:
+            body = ANOMALY.reply_review_failed(
+                t.get("subject", ""), str(err), t.get("attempts", 0))
+            do_reply(mid, body, [])
+            t["state"] = "REPLIED"
+            t["replied_at"] = iso()
+            t["notify_sent_at"] = iso()
+            save_task(t)
+            log(f"任务 {mid} 重试用尽，已回信告知发件人", "WARN")
+        except Exception as e2:
+            log(f"任务 {mid} 失败通知也发不出去: {e2}", "ERROR")
+    return t
+
+
+def process_candidate(cand: dict) -> None:
+    """处理一个已抢到的任务（不管成败都不往外抛，由调用方继续下一轮）"""
+    mid = cand["message_id"]
+    reason = ignore_reason(cand)
+    if reason:
+        cand["state"] = "IGNORED"
+        cand["ignore_reason"] = reason
+        save_task(cand)
+        log(f"任务 {mid} 标记为 IGNORED ({reason})")
+        return
+    log(f"开始处理任务 {mid}")
+    try:
+        r = process_task(mid)
+        log(f"任务 {mid} 完成: {r}")
+    except Exception as e:
+        mark_failed(cand, e)
+
+
 def worker_loop():
-    log("worker 启动")
-    last_scan = 0
+    """一个 worker 的循环（可多线程并行跑；并发数由 max_workers 决定）"""
+    log(f"worker 启动（{threading.current_thread().name}）")
     while True:
         try:
             # 每轮先重载：配置被改坏/改新都能自愈，且改动立即生效
-            reload_config()
+            _maybe_reload()
             # 用 .get 兜底：配置万一缺字段也不能把 worker 循环打挂
             # （之前直接 CONFIG["poll_interval_sec"] 会在 reload 之前抛
             #  KeyError，进程永远卡死、任务一直卡在 SEEN）
-            if now() - last_scan >= CONFIG.get("poll_interval_sec", 180):
-                scan_once()
-                last_scan = now()
-            # 取最老的待处理任务
-            cand = None
-            for t in all_tasks():
-                if t.get("state") in ("SEEN", "DOWNLOADED", "REVIEWED"):
-                    if t.get("next_retry_at", 0) and t["next_retry_at"] > now():
-                        continue
-                    cand = t
-                    break
-                if t.get("state") == "FAILED" and t.get("attempts", 0) < CONFIG.get("max_retries", 3):
-                    if t.get("next_retry_at", 0) and t["next_retry_at"] > now():
-                        continue
-                    cand = t
-                    break
+            _maybe_scan()
+            cand = next_task()
             if cand:
                 mid = cand["message_id"]
-                reason = ignore_reason(cand)
-                if reason:
-                    cand["state"] = "IGNORED"
-                    cand["ignore_reason"] = reason
-                    save_task(cand)
-                    log(f"任务 {mid} 标记为 IGNORED ({reason})")
+                if not claim_task(mid):
+                    time.sleep(1)
                     continue
-                log(f"开始处理任务 {mid}")
                 try:
-                    r = process_task(mid)
-                    log(f"任务 {mid} 完成: {r}")
-                except Exception as e:
-                    log(f"任务 {mid} 失败: {e}", "ERROR")
-                    t = load_task(mid) or cand
-                    t["state"] = "FAILED"
-                    t["last_error"] = str(e)[:2000]
-                    back = CONFIG["retry_backoff_sec"] * (2 ** max(0, t["attempts"] - 1))
-                    # 上游模型繁忙时退避得更久（过载不会 5 分钟就恢复）
-                    if is_provider_busy(str(e)):
-                        back = max(back, CONFIG.get("provider_busy_backoff_sec", 900))
-                        log(f"{mid} 判定为上游模型繁忙，退避延长到 {back}s", "WARN")
-                    t["next_retry_at"] = now() + back
-                    save_task(t)
-                    log(f"任务 {mid} 将在 {back}s 后重试")
-                    # 重试用尽 -> 回信告知发件人（不能石沉大海）
-                    if t.get("attempts", 0) >= CONFIG["max_retries"]:
-                        try:
-                            body = ANOMALY.reply_review_failed(
-                                t.get("subject", ""), str(e), t.get("attempts", 0))
-                            do_reply(mid, body, [])
-                            t["state"] = "REPLIED"
-                            t["replied_at"] = iso()
-                            t["notify_sent_at"] = iso()
-                            save_task(t)
-                            log(f"任务 {mid} 重试用尽，已回信告知发件人", "WARN")
-                        except Exception as e2:
-                            log(f"任务 {mid} 失败通知也发不出去: {e2}", "ERROR")
+                    process_candidate(cand)
+                finally:
+                    release_task(mid)
                 continue
             time.sleep(10)
         except KeyboardInterrupt:
@@ -2539,6 +2775,24 @@ def worker_loop():
         except Exception as e:
             log(f"worker 循环异常: {e}", "ERROR")
             time.sleep(15)
+
+
+def worker_pool():
+    """按 max_workers 起 N 个 worker 线程；N=1 时直接在当前线程跑（旧行为）"""
+    n = effective_workers()
+    if n <= 1:
+        worker_loop()
+        return
+    log(f"worker 池启动：并发 {n}（模型并发上限 {CONFIG.get('llm_max_concurrency', 2)}）")
+    ths = [threading.Thread(target=worker_loop, name=f"worker-{i + 1}", daemon=True)
+           for i in range(n)]
+    for th in ths:
+        th.start()
+    try:
+        while any(th.is_alive() for th in ths):
+            time.sleep(1)
+    except KeyboardInterrupt:
+        return
 
 
 def watch_loop():
@@ -2606,7 +2860,7 @@ def run_all():
     th.start()
     log(f"机器人已启动：watch 通道 + worker 队列 (pid={os.getpid()})")
     try:
-        worker_loop()
+        worker_pool()
     except KeyboardInterrupt:
         pass
     finally:
@@ -2681,8 +2935,14 @@ def status():
     print(f"单次输出上限: {st.get('max_output_tokens') or '-'} tokens   "
           f"分批上限: {CONFIG.get('review_chunk_files')} 文件 / "
           f"{CONFIG.get('max_chars_per_chunk')} 字符")
-    print(f"轮询间隔: {CONFIG['poll_interval_sec']}s   并发worker: {CONFIG['max_workers']}   "
-          f"最大重试: {CONFIG['max_retries']}")
+    print(f"轮询间隔: {CONFIG['poll_interval_sec']}s   最大重试: {CONFIG['max_retries']}   "
+          f"失败退避: {CONFIG.get('retry_backoff_sec')}s")
+    gate = rate_gate()
+    print(f"并发: worker {effective_workers()} 个 · 模型调用上限 {gate.limit} · "
+          f"分批并行 {CONFIG.get('chunk_workers', 2)} · "
+          f"限流冷却 {rate_cooldown():.0f}s"
+          + (f"（当前上游繁忙，已冷却 {gate.busy_for():.0f}s）" if gate.busy_for() > 0 else "")
+          + (f" · 正在处理 {len(claimed_tasks())} 个任务" if claimed_tasks() else ""))
     print(f"审批闸: {'开启（审核完先等人工审批再发送）' if require_approval() else '关闭（审核完自动发送）'}")
     print(f"处理中确认信: {'开启' if CONFIG.get('ack_enabled', True) else '关闭'}   "
           f"超时 {CONFIG.get('ack_timeout_sec', 300)}s 未出结果时发送")
@@ -3318,7 +3578,7 @@ def main():
     elif cmd == "run":
         run_all()
     elif cmd == "worker":
-        worker_loop()
+        worker_pool()
     elif cmd == "process":
         if getattr(a, "requirements", ""):
             t = load_task(a.id)

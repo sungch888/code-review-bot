@@ -72,9 +72,10 @@ def main():
         check("reload_config 后内存 CONFIG 完整", not missing2, f"仍缺: {missing2}")
 
         # 3) worker 循环用 .get 兜底（源码级检查，防止回退成硬下标）
+        #    注意：轮询/重载已拆成 _maybe_scan / _maybe_reload（多 worker 共享节流），
+        #    所以检查范围是「worker 那几个函数」而不是单个 worker_loop。
         src = (ROOT / "bot.py").read_text(encoding="utf-8")
-        loop_src = src.split("def worker_loop")[1][:1500]
-        # 只看代码行，忽略注释
+        loop_src = src.split("def _maybe_reload")[1].split("def watch_loop")[0]
         code_lines = [ln.strip() for ln in loop_src.splitlines()
                       if ln.strip() and not ln.strip().startswith("#")]
         hard = [ln for ln in code_lines if 'CONFIG["poll_interval_sec"]' in ln
@@ -83,7 +84,9 @@ def main():
         check("worker 循环用 CONFIG.get 兜底",
               'CONFIG.get("poll_interval_sec"' in loop_src)
         check("worker 每轮先 reload_config（可自愈）",
-              "reload_config()" in loop_src[:600])
+              "reload_config()" in loop_src.split("def _maybe_scan")[0])
+        check("worker_loop 每轮调 _maybe_reload",
+              "_maybe_reload()" in src.split("def worker_loop")[1][:800])
 
         # 4) 完整配置也能正常加载（不回归）
         CFG.write_text(backup, encoding="utf-8")

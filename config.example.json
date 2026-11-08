@@ -3,7 +3,7 @@
   "mailbox": "your-mailbox@agent.qq.com",
   "review_requirements": "",
   "poll_interval_sec": 180,
-  "max_workers": 1,
+  "max_workers": 2,
   "max_retries": 3,
   "retry_backoff_sec": 300,
   "max_extracted_mb": 300,
@@ -93,5 +93,8 @@
   "regression_review": true,
   "regression_max_issues": 80,
   "download_cookie": "",
-  "download_cookie_file": ""
+  "download_cookie_file": "",
+  "llm_max_concurrency": 2,
+  "llm_rate_cooldown_sec": 20,
+  "chunk_workers": 2
 }
