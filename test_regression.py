@@ -65,7 +65,7 @@ ISSUE_REPORT = """# 代码审核报告
 
 ## 问题清单
 
-| 编号 | 级别 | 文件:行号 | 问题描述 | 成因 | 后果 | 修改建议 |
+| 编号 | 级别 | 文件:行号 | 问题描述 | 成因 | 后果 | 修改建议 | 证据 |
 | --- | --- | --- | --- | --- | --- | --- |
 | 1 | 严重 | app/main.py:120 | 下单未校验金额，负数可提交 | 校验分散在多处，入口没拦 | 可被刷负单套利 | 入口统一校验 |
 | 2 | 高危 | app/api.py:40 | SQL 字符串拼接 | 缺统一的查询构造 | 注入可读全库 | 改用参数化 |
@@ -87,7 +87,8 @@ def rendered(tpl, **kw):
     base = dict(src="S", rpt="R", extra="", sections=B.spec_sections_text(),
                 count=1, idx=1, total=2, file_count=1, chunk_reports="CH",
                 files_path="P", chunks_path="P", files_content="FC", filelist="FL",
-                baseline="", methodology=B.load_methodology(True))
+                baseline="", methodology=B.load_methodology(True),
+                issue_columns=B.issue_columns_text(), cross_context="")
     base.update(kw)
     return tpl.format(**base)
 
@@ -181,7 +182,7 @@ def main():
     check("解析出文件:行号", rows[0]["loc"] == "app/main.py:120", rows[0]["loc"])
     check("解析出问题描述", "负数" in rows[0]["desc"], rows[0]["desc"])
     check("没有表格时返回空", B.extract_issue_rows("# 空报告\n没有表格") == [])
-    esc = ("| 编号 | 级别 | 文件:行号 | 问题描述 | 成因 | 后果 | 修改建议 |\n"
+    esc = ("| 编号 | 级别 | 文件:行号 | 问题描述 | 成因 | 后果 | 修改建议 | 证据 |\n"
            "| --- | --- | --- | --- | --- | --- | --- |\n"
            "| 1 | 中危 | a.py:1 | 管道 a\\|b 被截断 | 成因 | 后果 | 建议 |\n")
     row1 = B.extract_issue_rows(esc)
@@ -285,7 +286,7 @@ def main():
     good = ("# 代码审核报告\n\n## 本次审核要求\n无，按标准审核流程执行。\n\n"
             "## 总体评价\n订单服务，Python + FastAPI，约 1200 行。整体质量评分：72 分。"
             + "评分依据为入口校验完整度与并发处理。" * 8 + "\n\n"
-            "## 问题清单\n| 编号 | 级别 | 文件:行号 | 问题描述 | 成因 | 后果 | 修改建议 |\n"
+            "## 问题清单\n| 编号 | 级别 | 文件:行号 | 问题描述 | 成因 | 后果 | 修改建议 | 证据 |\n"
             "| --- | --- | --- | --- | --- | --- | --- |\n"
             "| 1 | 严重 | app/main.py:120 | 未校验金额 | 校验分散 | 可刷负单 | 入口统一校验 |\n\n"
             "## 严重与高危问题详述\n见上。\n\n## 安全性专项检查\n未发现命令注入。\n\n"

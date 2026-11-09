@@ -359,6 +359,11 @@ def spec_table_columns(section_id: str = "issues_table") -> list:
     return []
 
 
+def issue_columns_text() -> str:
+    """问题清单的列名（从模板取，提示词里不再手写第二份）"""
+    return " | ".join(spec_table_columns("issues_table"))
+
+
 def spec_sections_text(baseline: bool = False) -> str:
     """把报告章节规范渲染成提示词片段（提示词与校验器共用一份规范）"""
     out = []
@@ -1842,10 +1847,14 @@ REVIEW_PROMPT_HTTP_CHUNK = """你是一名资深代码审查工程师。这是�
 你输出它们只会把篇幅撑爆。请**只输出下面两部分**：
 
 ### 一、本批问题清单
-Markdown 表格，列头严格为：`编号 | 级别 | 文件:行号 | 问题描述 | 成因 | 后果 | 修改建议`
+Markdown 表格，列头严格为：`{issue_columns}`
 - 级别只用：严重 / 高危 / 中危 / 低危
 - **成因**：结构上是什么导致它变成这样（不是「开发不小心」）；
   **后果**：不改会发生什么、谁受影响——这两栏都得写，不能空格。
+- **证据**：这条判断的依据是什么——引用具体文件行号/状态机行/锁/条件更新（代码事实），
+  或写「需实测（见验证方式 N）」。静态读代码定不了论的，**不要用肯定语气断言后果**。
+- 若本批涉及**状态流转 / 并发 / 幂等**，在表格后用一行记下你看到的**门控机制**
+  （状态机里该状态的出边、锁、条件更新、唯一约束），供汇总阶段判断可达性。
 - 每条都要能对应到上面给出的真实行号
 - 没发现问题就写一行「本批未发现问题」，**不要编造**
 
@@ -1876,16 +1885,35 @@ REVIEW_PROMPT_HTTP_MERGE = """你是资深代码审查工程师的**总审**。�
 最终的各章节需要你**基于这些问题清单重新归纳**。
 
 {chunk_reports}
-
+{cross_context}
 ## 最终报告结构（中文）
 请**逐字**使用下列标题：
 
 {sections}
 
+## 定级规则：先判可达性，再定级别
+
+对**并发 / 幂等 / 状态流转 / 重复入账**这类问题，必须先判断「那条坏路径到底能不能发生」，
+判断依据用上面的**跨文件事实**（状态机流转表、数据库唯一约束）和各批报告里的锁/条件更新：
+
+- **不可达**（例如：终态没有出边、状态机拒绝该事件、已有唯一约束、
+  同一事务 + 条件更新保证只有一个成功）：
+  级别最多「中」，后果栏改成条件句并写明「当前不可达，因为〈具体依据〉」；
+  这类属于**加固建议**，不是待修缺陷。
+- **可达**：保留按后果严重程度定的级别，后果栏写触发条件，并给出可复现的触发路径。
+- **判断不了**（材料不足以定论）：级别最多「中」，证据栏写「需实测」，
+  并在「待确认项与验证方式」一节给出**可执行的验证步骤**（看哪个文件/跑什么操作、
+  看到什么算确认、看到什么算不成立）。
+
+同样地，**提加唯一约束/改 schema 的建议前**，先确认该约束不会与现存合法数据冲突
+（例如同一 sourceType 是否承载多种业务对象、各用各的自增编号）——
+冲突就改成「需先补区分字段，属迁移级改动」，不要直接建议建约束。
+
 ## 合并规则
 1. **问题清单表**：汇总到一张表，重新连续编号；同一根因在不同批次重复出现的**合并为一条**。
-   列头严格为 `编号 | 级别 | 文件:行号 | 问题描述 | 成因 | 后果 | 修改建议`；
-   某一条缺「成因」或「后果」的，你要**补完**（从问题描述与代码片段推导）。
+   列头严格为 `{issue_columns}`；
+   某一条缺「成因」「后果」「证据」的，你要**补完**（从问题描述与代码片段推导）。
+   **合并时注意**：不同批次报的同一个根因，只保留一条，但要把各批的证据合起来写全。
 2. **严重与高危问题详述**：保留最有代表性的代码片段，按严重级别排序。
 3. **总体评价**：项目用途、技术栈、总代码规模、整体质量评分（0-100，综合各批判断并说明依据）。
 4. **安全性专项检查 / 架构与可维护性 / 测试与工程化**：按整个项目重新归纳，不要简单拼接。
@@ -1971,6 +1999,29 @@ def plan_batches(files, max_files: int, max_chars: int):
     return batches
 
 
+def _strip_repeated_prefix(prev: str, new: str, head_lines: int = 3) -> str:
+    """续写时模型可能**从头重写**，把与上文重复的前缀裁掉
+
+    真实事故：长报告被截断后，模型续写时重新输出了一整份，
+    结果同一条问题在报告里出现 4 次（编号到 400，实际只有 ~100 条）。
+    """
+    if not prev or not new:
+        return new
+    prev_lines = [l.rstrip() for l in prev.splitlines()]
+    new_lines = [l.rstrip() for l in new.splitlines()]
+    head = new_lines[:head_lines]
+    if len(head) < head_lines or len(prev_lines) < head_lines:
+        return new
+    for i in range(len(prev_lines) - head_lines, -1, -1):
+        if prev_lines[i:i + head_lines] == head:
+            rest = new_lines[head_lines:]
+            # 只在裁掉后仍有实质内容时才裁，避免把续写整段吃掉
+            if len(rest) >= 3 or len("\n".join(rest)) > 200:
+                return "\n".join(rest)
+            return new
+    return new
+
+
 def _unwrap_fences(text: str) -> str:
     """模型有时把整份报告包在 ```markdown ... ``` 里，剥掉外壳"""
     t = (text or "").strip()
@@ -1991,7 +2042,7 @@ class Backend:
         raise NotImplementedError
 
     def merge_prompt(self, chunk_reports: str, *, sections: str,
-                     baseline_block: str, ctx: dict) -> str:
+                     baseline_block: str, cross_context: str, ctx: dict) -> str:
         raise NotImplementedError
 
     def single_prompt(self, files, *, sections: str, baseline_block: str,
@@ -2060,12 +2111,15 @@ class HttpBackend(Backend):
         return REVIEW_PROMPT_HTTP_CHUNK.format(
             src=str(ctx["src"]), idx=i, total=total, extra=extra or "",
             sections=sections, count=len(batch), baseline=baseline_block,
+            issue_columns=issue_columns_text(),
             methodology=load_methodology(full=False),
             files_content=file_payload(batch, ctx["src"], ctx["max_file_chars"]))
 
-    def merge_prompt(self, chunk_reports, *, sections, baseline_block, ctx):
+    def merge_prompt(self, chunk_reports, *, sections, baseline_block,
+                     cross_context, ctx):
         return REVIEW_PROMPT_HTTP_MERGE.format(
             src=str(ctx["src"]), sections=sections, chunk_reports=chunk_reports,
+            cross_context=cross_context, issue_columns=issue_columns_text(),
             methodology=load_methodology(full=False), baseline=baseline_block,
             file_count=ctx["file_count"])
 
@@ -2129,6 +2183,13 @@ class HttpBackend(Backend):
         for i in range(max_rounds):
             r = self._call(msgs, tag if i == 0 else f"{tag}(续写{i})")
             piece = _unwrap_fences(r.text)
+            if text:
+                # 模型可能从头重写：裁掉与上文重复的前缀（否则同一条问题会出现 4 次）
+                stripped = _strip_repeated_prefix(text, piece)
+                if stripped != piece:
+                    log(f"[{self.mid}] {tag}: 续写内容与上文重复，已裁掉 "
+                        f"{len(piece) - len(stripped)} 字符", "WARN")
+                    piece = stripped
             text += ("\n" if text else "") + piece
             if not r.truncated:
                 still_cut = False
@@ -2186,13 +2247,16 @@ class PiBackend(Backend):
         return REVIEW_PROMPT_CHUNK.format(
             src=str(ctx["src"]), rpt=str(ctx["rpt"]), extra=extra or "",
             idx=i, total=total, baseline=baseline_block, filelist=fl,
-            sections=sections)
+            issue_columns=issue_columns_text(), sections=sections)
 
-    def merge_prompt(self, chunk_reports, *, sections, baseline_block, ctx):
+    def merge_prompt(self, chunk_reports, *, sections, baseline_block,
+                     cross_context, ctx):
         return REVIEW_PROMPT_MERGE.format(
             src=str(ctx["src"]), rpt=str(ctx["rpt"]),
             chunks_path=str(ctx["rpt"] / "_all_chunks.md"),
-            baseline=baseline_block, sections=sections)
+            cross_context=cross_context, baseline=baseline_block,
+            issue_columns=issue_columns_text(),
+            sections=sections)
 
     def single_prompt(self, files, *, sections, baseline_block, ctx):
         return REVIEW_PROMPT.format(
@@ -2266,6 +2330,56 @@ class PiBackend(Backend):
         return self._read_out(md_path)
 
 
+def cross_context_files(src: Path, files, max_chars: int = 60000):
+    """挑出「跨文件事实」的文件，喂给汇总阶段
+
+    可达性判断需要看**别的文件**：状态机定义（终态有没有出边）、
+    数据库 schema（有没有唯一约束）。分批审的时候这些文件往往不在同一批，
+    模型只能看到片段 -> 就会把不可达的路径当成可达的报出来。
+
+    按优先级取：schema > 状态机 > 唯一约束定义；同类最多 2 个。
+    """
+    buckets = {"schema": [], "state": [], "unique": []}
+    for pth in files:
+        try:
+            if pth.stat().st_size > 400_000:
+                continue
+            text = pth.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        rel = pth.relative_to(src).as_posix()
+        if rel.endswith("schema.prisma"):
+            buckets["schema"].append((pth, "数据库模型与唯一约束", text))
+        elif "TRANSITIONS" in text and "state-machine" in pth.name:
+            buckets["state"].append((pth, "状态机流转表（终态是否有出边）", text))
+        elif "@@unique" in text or "CREATE UNIQUE INDEX" in text:
+            buckets["unique"].append((pth, "唯一约束定义", text))
+    picks, total = [], 0
+    for key, quota in (("schema", 1), ("state", 2), ("unique", 2)):
+        for pth, why, text in buckets[key]:
+            if len(picks) >= 6 or total + len(text) > max_chars:
+                break
+            picks.append((pth, why, text))
+            total += len(text)
+    return picks
+
+
+def render_cross_context(picks) -> str:
+    if not picks:
+        return ""
+    parts = ["", "## 跨文件事实（判断可达性必须看这些）", "",
+             "下面是跨文件的定义。它们决定「某些坏路径到底能不能发生」，",
+             "判断并发/幂等/状态类问题时**必须**先对照它们：", ""]
+    for pth, why, text in picks:
+        parts.append(f"### {pth.name}（{why}）")
+        parts.append("")
+        parts.append("```")
+        parts.append(text[:20000])
+        parts.append("```")
+        parts.append("")
+    return "\n".join(parts)
+
+
 def _chunk_reusable(cp: Path, need_check: list, mid: str) -> bool:
     """旧分块报告能不能复用
 
@@ -2331,8 +2445,13 @@ def review_pipeline(mid: str, src: Path, rpt: Path, files, extra: str, warnings:
             f"### 第{i + 1}批（{p.name}）\n" + p.read_text(encoding="utf-8", errors="replace")
             for i, p in enumerate(chunk_paths))
         (rpt / "_all_chunks.md").write_text(all_chunks, encoding="utf-8")
+        picks = cross_context_files(src, files)
+        if picks:
+            log(f"[{mid}] 跨文件事实上下文: " +
+                ", ".join(f"{p.name}({w})" for p, w, _ in picks))
         prompt = backend.merge_prompt(all_chunks, sections=sections,
-                                      baseline_block=render_baseline_merge(bl), ctx=ctx)
+                                      baseline_block=render_baseline_merge(bl),
+                                      cross_context=render_cross_context(picks), ctx=ctx)
         md.write_text(backend.generate(prompt, "汇总", md), encoding="utf-8")
         log(f"[{mid}] 汇总完成: {md.stat().st_size} bytes")
     else:
@@ -2367,6 +2486,20 @@ def _review_via_pi(mid: str, src: Path, rpt: Path, files, extra: str, warnings: 
     backend = PiBackend(mid, src, rpt, warnings)
     log(f"[{mid}] 模型后端: {backend.describe()}")
     return review_pipeline(mid, src, rpt, files, extra, warnings, baseline, backend)
+
+
+def count_duplicate_issues(md_text: str) -> int:
+    """问题清单里「同一条重复出现」的条数（续写/合并没做好时的信号）"""
+    import re as _re
+    seen, dup = set(), 0
+    for m in _re.finditer(r"^\|\s*\d+\s*\|\s*[^|]*\|\s*([^|]*?)\s*\|\s*([^|]*?)\s*\|",
+                          str(md_text or ""), _re.M):
+        key = (m.group(1).strip()[:80], m.group(2).strip()[:60])
+        if key in seen:
+            dup += 1
+        else:
+            seen.add(key)
+    return dup
 
 
 def build_summary_from_report(md_text: str, n_new: int = 0) -> str:
@@ -2466,6 +2599,11 @@ def run_review(task, extra: str = "", baseline: dict = None) -> Path:
 
     # 闭环统计：表格确定性解析，不采信模型自述的数字
     final_txt = md.read_text(encoding="utf-8", errors="replace")
+    dup = count_duplicate_issues(final_txt)
+    if dup:
+        warnings.append(f"报告的问题清单里有 {dup} 条重复（同一位置同一描述出现多次），"
+                        "请对照代码去重后再看")
+        log(f"[{mid}] 报告里有 {dup} 条重复问题", "WARN")
     task["new_issues"] = len(extract_issue_rows(final_txt))
     if baseline:
         tr = parse_tracking(final_txt)
@@ -2594,12 +2732,13 @@ WORKING_STATES = (State.SEEN, State.DOWNLOADED, State.REVIEWED,
 # 合法状态转移表：写错状态会在这里被拦住（而不是悄悄写成非法状态）
 ALLOWED_TRANSITIONS = {
     # SEEN 也可以直接到 REPLIED：附件缺失/解压失败等异常分支会当场回信
-    State.SEEN: {State.DOWNLOADED, State.REPLIED, State.FAILED, State.IGNORED},
+    State.SEEN: {State.DOWNLOADED, State.REPLIED, State.REVIEWED, State.FAILED, State.IGNORED},
     State.DOWNLOADED: {State.REVIEWED, State.REPLIED, State.FAILED, State.IGNORED},
     State.REVIEWED: {State.AWAITING_APPROVAL, State.REPLIED, State.FAILED},
     State.AWAITING_APPROVAL: {State.REPLIED, State.REJECTED, State.FAILED},
     State.FAILED: {State.SEEN, State.REPLIED},     # SEEN=重试，REPLIED=失败通知已发
-    State.REPLIED: set(),
+    # REPLIED 只能被**显式复审**重新打开（review_existing），其它路径一律拒绝
+    State.REPLIED: {State.REVIEWED},
     State.REJECTED: set(),
     State.IGNORED: set(),
 }
@@ -2631,6 +2770,11 @@ def set_state(task: dict, new: str, where: str = "") -> str:
         return old
     if not can_transition(old, new):
         log(f"[{task.get('message_id')}] 非法状态转移 {old} -> {new}（{where}），已拒绝", "WARN")
+        return old
+    # REPLIED -> REVIEWED 只允许显式复审打开，防止别的路径把已回信的任务拖回队列
+    if old == State.REPLIED and new == State.REVIEWED and not where.startswith("review_existing"):
+        log(f"[{task.get('message_id')}] 拒绝 {old} -> {new}（{where}）：只有显式复审可以重开",
+            "WARN")
         return old
     task["state"] = new
     return new
@@ -2751,6 +2895,51 @@ def do_reply(mid, body, files):
     d = run_cli(args, timeout=300)
     log(f"[{mid}] 回复已发送: {json.dumps(d, ensure_ascii=False)[:300]}")
     return d
+
+
+def review_existing(mid: str, reply: bool = False) -> str:
+    """对**已在本地**的代码包重新审核（不读邮件、不下载附件）
+
+    用途：
+      - 复核/演练：换个方法论重跑一遍，只看报告，不打扰发件人
+      - 邮件已删/取不到，但代码包还在时重审
+    默认不发信（reply=True 才发）。
+    """
+    t = load_task(mid)
+    if t is None:
+        raise RuntimeError("任务不存在")
+    src = WORK / mid / "src"
+    if not src.exists():
+        raise RuntimeError(f"本地没有代码包：{src}")
+    files = collect_source_files(src, CONFIG["max_review_files"])
+    if not files:
+        raise RuntimeError("代码包内未找到可审核的源码文件")
+    log(f"[{mid}] 复审：本地代码包 {len(files)} 个文件（不读邮件、不发信）")
+    reqs = collect_requirements(t, "", src)
+    extra = render_requirements(reqs)
+    t["requirements_effective"] = [{"source": s, "text": x} for s, x in reqs]
+    ensure_identity(t)
+    baseline = prepare_baseline(t)
+    if baseline:
+        t["baseline_mid"] = baseline["mid"]
+        t["baseline_round"] = baseline["prev_round"]
+        t["baseline_issue_count"] = baseline["total"]
+        t["review_round"] = baseline["round"]
+    save_task(t)
+    rpt = run_review(t, extra, baseline)
+    t["report"] = str(rpt)
+    set_state(t, State.REVIEWED, "review_existing/复审重开")
+    t["last_error"] = None
+    save_task(t)
+    if reply:
+        send_reply(t, rpt)
+        set_state(t, State.REPLIED, "review_existing/回信")
+        t["replied_at"] = iso()
+        save_task(t)
+        log(f"[{mid}] 复审完成并已发送报告")
+    else:
+        log(f"[{mid}] 复审完成：{rpt}（未发送邮件）")
+    return str(rpt)
 
 
 def resend_task(mid: str, regen_summary: bool = True) -> dict:
@@ -3050,6 +3239,14 @@ def process_task(mid: str) -> str:
             save_task(t)
             log(f"[{mid}] 审核完成，等待人工审批（require_approval 已开启）")
             return "AWAITING_APPROVAL"
+
+        # 「只审不发」模式：复核/演练时用，报告照样生成，只是不打扰发件人
+        if t.get("no_reply"):
+            set_state(t, State.REVIEWED, "process_task/只审不发")
+            t["last_error"] = None
+            save_task(t)
+            log(f"[{mid}] 只审不发模式：报告已生成 {rpt}（未发送邮件）")
+            return "REVIEWED_NO_REPLY"
 
         # 未开审批 -> 直接回复（带报告附件）
         send_reply(t, rpt)
@@ -3922,6 +4119,9 @@ def main():
     p.add_argument("--fallback", default=None, help="上游繁忙时自动切换的备用模型")
     p.add_argument("--max-tokens", dest="max_tokens", default=None, help="单次最大输出 tokens")
     p.add_argument("--temperature", default=None, help="采样温度")
+    p = sub.add_parser("review", help="对本地已有的代码包重新审核（不读邮件；默认不发信）")
+    p.add_argument("--id", required=True, help="任务 id（代码包需已在 work/<id>/src）")
+    p.add_argument("--reply", action="store_true", help="审完后把报告发回原邮件")
     p = sub.add_parser("resend", help="重新生成摘要并补发报告（不重新审核）")
     p.add_argument("--id", required=True, help="任务 id")
     p.add_argument("--no-summary", action="store_true", help="不重新生成摘要，直接重发原报告")
@@ -4014,6 +4214,13 @@ def main():
         sys.exit(cmd_model(a))
     elif cmd == "cookie":
         sys.exit(cmd_cookie(a))
+    elif cmd == "review":
+        try:
+            rpt = review_existing(a.id, reply=getattr(a, "reply", False))
+            print(f"复审完成: {rpt}")
+        except Exception as e:
+            print(f"复审失败: {e}")
+            sys.exit(1)
     elif cmd == "resend":
         try:
             resend_task(a.id, regen_summary=not getattr(a, "no_summary", False))

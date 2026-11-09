@@ -65,7 +65,8 @@ def main():
     def rendered(tpl, **kw):
         base = dict(src="S", rpt="R", extra="", sections="SEC", count=1,
                     idx=1, total=2, file_count=1, chunk_reports="CH",
-                    files_content="FC", filelist="FL", baseline="", methodology=meth)
+                    files_content="FC", filelist="FL", baseline="", methodology=meth,
+                    issue_columns=B.issue_columns_text(), cross_context="")
         base.update(kw)
         return tpl.format(**base)
 
@@ -77,8 +78,8 @@ def main():
     chunk = rendered(B.REVIEW_PROMPT_HTTP_CHUNK, methodology=meth_slim)
     check("分批提示词注入精简方法论",
           ("认知负担" in chunk) or ("不要报什么" in chunk or "不该报" in chunk))
-    check("分批提示词表头含 成因/后果",
-          "编号 | 级别 | 文件:行号 | 问题描述 | 成因 | 后果 | 修改建议" in chunk,
+    check("分批提示词表头含 成因/后果/证据",
+          "编号 | 级别 | 文件:行号 | 问题描述 | 成因 | 后果 | 修改建议 | 证据" in chunk,
           chunk[:300])
 
     merge = rendered(B.REVIEW_PROMPT_HTTP_MERGE, methodology=meth_slim)
@@ -100,15 +101,15 @@ def main():
 
     # ---------- C. 校验器与擦除 ----------
     # 正常报告不该被判泄露
-    normal = ("## 问题清单\n| 编号 | 级别 | 文件:行号 | 问题描述 | 成因 | 后果 | 修改建议 |\n"
+    normal = ("## 问题清单\n| 编号 | 级别 | 文件:行号 | 问题描述 | 成因 | 后果 | 修改建议 | 证据 |\n"
               "| --- | --- | --- | --- | --- | --- | --- |\n"
-              "| 1 | 严重 | a.py:1 | SQL 拼接 | 直接拼参数 | 可被注入读全库 | 参数化 |\n")
+              "| 1 | 严重 | a.py:1 | SQL 拼接 | 直接拼参数 | 可被注入读全库 | 参数化 | 代码事实 a.py:1 |\n")
     clean, hits = B.scrub_attribution(normal)
     check("正常中文报告不被误擦", hits == [] and clean == normal, str(hits))
 
     leaked = ("## 问题清单\n依据 Brooks-Lint 的 R1 定义，"
               "Symptom: SQL 拼接\nSource: Refactoring\n"
-              "| 编号 | 级别 | 文件:行号 | 问题描述 | 成因 | 后果 | 修改建议 |\n")
+              "| 编号 | 级别 | 文件:行号 | 问题描述 | 成因 | 后果 | 修改建议 | 证据 |\n")
     clean2, hits2 = B.scrub_attribution(leaked)
     check("擦除函数能识别泄露", len(hits2) >= 2, str(hits2))
     check("擦除后不再含 Brooks", "Brooks" not in clean2, clean2[:120])
@@ -129,7 +130,7 @@ def main():
     check("规范列含 成因/后果",
           "成因" in cols and "后果" in cols, str(cols))
     check("规范列顺序正确",
-          cols == ["编号", "级别", "文件:行号", "问题描述", "成因", "后果", "修改建议"],
+          cols == ["编号", "级别", "文件:行号", "问题描述", "成因", "后果", "修改建议", "证据"],
           str(cols))
     check("规范声明了禁泄露检查",
           any("forbidden" in gc for gc in B.REPORT_SPEC.get("global_checks", [])))

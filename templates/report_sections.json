@@ -22,8 +22,17 @@
       "level": 2,
       "required": true,
       "type": "table",
-      "columns": ["编号", "级别", "文件:行号", "问题描述", "成因", "后果", "修改建议"],
-      "hint": "用 Markdown 表格，列头必须严格为：编号 | 级别 | 文件:行号 | 问题描述 | 成因 | 后果 | 修改建议。级别四档：严重 / 高 / 中 / 低。成因写结构上的原因（不是「开发不小心」），后果写不改会怎样、谁受影响；两栏不得留空。"
+      "columns": [
+        "编号",
+        "级别",
+        "文件:行号",
+        "问题描述",
+        "成因",
+        "后果",
+        "修改建议",
+        "证据"
+      ],
+      "hint": "用 Markdown 表格，列头必须严格为：编号 | 级别 | 文件:行号 | 问题描述 | 成因 | 后果 | 修改建议 | 证据。级别四档：严重 / 高 / 中 / 低。成因写结构上的原因（不是「开发不小心」），后果写不改会怎样、谁受影响；两栏不得留空。证据栏写清这条判断的依据：「代码事实（file.ts:行号 具体内容）」或「需实测（见验证方式 N）」——静态读代码无法定论的不要写成肯定语气。"
     },
     {
       "id": "severity_detail",
@@ -54,6 +63,13 @@
       "hint": "测试覆盖现状、缺失的用例、CI/CD、依赖管理、文档。"
     },
     {
+      "id": "verification",
+      "title": "验证方式",
+      "level": 2,
+      "required": false,
+      "hint": "对每条需要运行期证据才能定论的问题（并发时序、数据库唯一约束、配置是否生效、数据是否已存在冲突），写出可复现的步骤：谁做什么操作、看到什么算确认、看到什么算不成立。静态可验证的结论不必列这一节。"
+    },
+    {
       "id": "conclusion",
       "title": "结论与放行建议",
       "level": 2,
@@ -68,18 +84,67 @@
       "level": 2,
       "required": true,
       "type": "table",
-      "columns": ["编号", "级别", "上轮问题", "本轮判定", "证据", "说明"],
+      "columns": [
+        "编号",
+        "级别",
+        "上轮问题",
+        "本轮判定",
+        "证据",
+        "说明"
+      ],
       "hint": "只在同一个项目有上一轮审核报告时必须出现。逐条覆盖上一轮的全部问题，本轮判定只能是：已修复 / 部分修复 / 未修复 / 无法确认（四选一，不得留空）；证据写文件:行号，文件已不存在就写「文件已不存在」。本轮未修复的旧问题不要再重复列进「问题清单」。"
     }
   ],
   "global_checks": [
-    {"id": "score", "desc": "总体评价中包含 0-100 的整数评分", "pattern": "(?:评分|得分|score)[^0-9]{0,12}(\\d{1,3})"},
-    {"id": "verdict", "desc": "结论中出现放行档位词", "pattern": "(可放行|修改后放行|不建议放行)"},
-    {"id": "issue_table_header", "desc": "问题清单表头列名正确", "pattern": "编号\\s*\\|\\s*级别\\s*\\|\\s*文件[:：]?\\s*行号\\s*\\|\\s*问题描述\\s*\\|\\s*成因\\s*\\|\\s*后果\\s*\\|\\s*修改建议"},
-    {"id": "no_attribution", "desc": "报告中不得出现方法论/工具/书籍的来源名称", "forbidden": ["Brooks-Lint", "brooks-lint", "Brooks", "ub-mode", "ub mode", "Iron Law", "Decay Risk", "Cognitive Overload", "Change Propagation", "Knowledge Duplication", "Accidental Complexity", "Dependency Disorder", "Domain Model Distortion", "Symptom:", "Source:", "Consequence:", "Remedy:"]},
-    {"id": "min_length", "desc": "报告正文长度达标", "min_chars": 800}
+    {
+      "id": "score",
+      "desc": "总体评价中包含 0-100 的整数评分",
+      "pattern": "(?:评分|得分|score)[^0-9]{0,12}(\\d{1,3})"
+    },
+    {
+      "id": "verdict",
+      "desc": "结论中出现放行档位词",
+      "pattern": "(可放行|修改后放行|不建议放行)"
+    },
+    {
+      "id": "issue_table_header",
+      "desc": "问题清单表头列名正确",
+      "pattern": "编号\\s*\\|\\s*级别\\s*\\|\\s*文件[:：]?\\s*行号\\s*\\|\\s*问题描述\\s*\\|\\s*成因\\s*\\|\\s*后果\\s*\\|\\s*修改建议"
+    },
+    {
+      "id": "no_attribution",
+      "desc": "报告中不得出现方法论/工具/书籍的来源名称",
+      "forbidden": [
+        "Brooks-Lint",
+        "brooks-lint",
+        "Brooks",
+        "ub-mode",
+        "ub mode",
+        "Iron Law",
+        "Decay Risk",
+        "Cognitive Overload",
+        "Change Propagation",
+        "Knowledge Duplication",
+        "Accidental Complexity",
+        "Dependency Disorder",
+        "Domain Model Distortion",
+        "Symptom:",
+        "Source:",
+        "Consequence:",
+        "Remedy:"
+      ]
+    },
+    {
+      "id": "min_length",
+      "desc": "报告正文长度达标",
+      "min_chars": 800
+    }
   ],
-  "verdict_keywords": ["可放行", "修改后放行", "不建议放行"],
+  "verdict_keywords": [
+    "可放行",
+    "修改后放行",
+    "不建议放行"
+  ],
   "html_style": {
     "title": "代码审核报告",
     "accent": "#c0392b",

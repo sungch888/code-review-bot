@@ -96,7 +96,7 @@ class FakeProvider:
                 raise B.LLM.ProviderBusy("触发限流（429）", status=429)
             time.sleep(self.delay)
             return types.SimpleNamespace(
-                text=("## 问题清单\n\n| 编号 | 级别 | 文件:行号 | 问题描述 | 成因 | 后果 | 修改建议 |\n"
+                text=("## 问题清单\n\n| 编号 | 级别 | 文件:行号 | 问题描述 | 成因 | 后果 | 修改建议 | 证据 |\n"
                       "| --- | --- | --- | --- | --- | --- | --- |\n"
                       "| 1 | 高 | a.py:1 | 示例问题 | 成因 | 后果 | 建议 |\n"),
                 elapsed=self.delay, finish_reason="stop", truncated=False)

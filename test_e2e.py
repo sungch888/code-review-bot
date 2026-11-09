@@ -94,7 +94,7 @@ def report_text(tracking=None) -> str:
 
 {track}## 问题清单
 
-| 编号 | 级别 | 文件:行号 | 问题描述 | 成因 | 后果 | 修改建议 |
+| 编号 | 级别 | 文件:行号 | 问题描述 | 成因 | 后果 | 修改建议 | 证据 |
 | --- | --- | --- | --- | --- | --- | --- |
 {rows}
 
@@ -126,7 +126,7 @@ cur.execute("SELECT * FROM orders WHERE id = " + str(order_id))
 
 CHUNK_TEXT = """### 一、本批问题清单
 
-| 编号 | 级别 | 文件:行号 | 问题描述 | 成因 | 后果 | 修改建议 |
+| 编号 | 级别 | 文件:行号 | 问题描述 | 成因 | 后果 | 修改建议 | 证据 |
 | --- | --- | --- | --- | --- | --- | --- |
 | 1 | 高危 | app/main.py:10 | 本批 SQL 拼接 | 直接拼参数 | 可读全库 | 参数化 |
 
@@ -631,6 +631,58 @@ def main():
               len(env.files("msg_s13")) >= 1, str(env.files("msg_s13")))
         check("resend 邮件正文里没有兼底文案",
               "详细结论见附件报告" not in env.body("msg_s13"), env.body("msg_s13")[:200])
+    finally:
+        env.close()
+
+    # ================= S14 只审不发 / 复审（不读邮件、不发信）=================
+    env = Env()
+    try:
+        env.add_task("msg_s14", "代码审核 - 只审不发", SMALL)
+        env.run("msg_s14")
+        t = B.load_task("msg_s14")
+        t["no_reply"] = True
+        B.save_task(t)
+        env.replies.clear()
+        n_before = len(env.provider.prompts)
+        rpt = B.review_existing("msg_s14", reply=False)
+        check("review_existing 生成了报告", Path(rpt, "代码审核报告.md").is_file(), rpt)
+        check("review_existing 默认不发邮件", not env.replies.get("msg_s14"),
+              str(env.replies.get("msg_s14")))
+        check("review_existing 确实重新调了模型",
+              len(env.provider.prompts) > n_before, str(len(env.provider.prompts)))
+        check("review_existing 后状态是 REVIEWED（不是 REPLIED）",
+              B.load_task("msg_s14")["state"] == B.State.REVIEWED,
+              B.load_task("msg_s14")["state"])
+    finally:
+        env.close()
+
+    # ================= S15 续写重复 / 重复检测 =================
+    env = Env()
+    try:
+        # 1) 裁剪器：模型续写时从头重写
+        prev = ("| 1 | 严重 | a.py:1 | 问题一 | 成因 | 后果 | 建议 | 证据 |\n"
+                "| 2 | 高 | b.py:2 | 问题二 | 成因 | 后果 | 建议 | 证据 |\n\n"
+                "## 详细\n已经写好的正文……")
+        again = ("| 1 | 严重 | a.py:1 | 问题一 | 成因 | 后果 | 建议 | 证据 |\n"
+                 "| 2 | 高 | b.py:2 | 问题二 | 成因 | 后果 | 建议 | 证据 |\n\n"
+                 "## 详细\n已经写好的正文……\n| 3 | 中 | c.py:3 | 问题三 | 成因 | 后果 | 建议 | 证据 |\n")
+        cut = B._strip_repeated_prefix(prev, again)
+        check("续写重复前缀被裁掉", cut.count("| 1 | 严重") == 0, cut[:120])
+        check("裁剪后保留了新内容", "| 3 | 中" in cut, cut[-120:])
+        check("没有重复时不裁剪", B._strip_repeated_prefix(prev, "全新的内容\n第二行\n第三行"))
+        check("空输入不炸", B._strip_repeated_prefix("", "x") == "x"
+              and B._strip_repeated_prefix("x", "") == "")
+
+        # 2) 重复检测
+        dup_md = ("| 编号 | 级别 | 文件:行号 | 问题描述 | 成因 | 后果 | 修改建议 | 证据 |\n"
+                  "| --- | --- | --- | --- | --- | --- | --- | --- |\n"
+                  "| 1 | 严重 | a.py:1 | 同一个问题 | x | y | z | w |\n"
+                  "| 2 | 高 | a.py:1 | 同一个问题 | x | y | z | w |\n")
+        check("能数出重复条数", B.count_duplicate_issues(dup_md) == 1,
+              str(B.count_duplicate_issues(dup_md)))
+        check("无重复时为 0", B.count_duplicate_issues(
+            "| 1 | 严重 | a.py:1 | 问题一 | x | y | z | w |\n"
+            "| 2 | 高 | b.py:2 | 问题二 | x | y | z | w |\n") == 0)
     finally:
         env.close()
 
