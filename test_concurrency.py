@@ -248,7 +248,9 @@ def main():
               str(md))
         check("分块确实并行（峰值 >= 2）", fake.peak >= 2, f"peak={fake.peak}")
         check("并行不超模型并发上限", fake.peak <= 2, f"peak={fake.peak}")
-        check("4 块 + 1 次汇总 = 5 次调用", fake.calls == 5, f"calls={fake.calls}")
+        # 4 块 + 4 个章节段（总体评价/详述/专项/收尾）；清单由本地生成，不调模型
+        check("4 块 + 4 段章节 = 8 次调用（清单本地生成，不调模型）",
+              fake.calls == 8, f"calls={fake.calls}")
 
         # 429：冷却后重试一次应成功
         B.CONFIG["llm_max_concurrency"] = 1

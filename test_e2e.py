@@ -70,6 +70,34 @@ ISSUES = [("严重", "app/main.py:10", "SQL 字符串拼接", "直接拼参数",
           ("中危", "app/api.py:22", "无入参校验", "校验分散", "可被负数下单")]
 
 
+def report_part(kind: str, tracking=None) -> str:
+    """按段返回报告内容（模拟真实分段生成）"""
+    full = report_text(tracking)
+    heads = ["## 总体评价", "## 问题清单", "## 严重与高危问题详述",
+             "## 安全性专项检查", "## 架构与可维护性", "## 测试与工程化",
+             "## 结论与放行建议"]
+    # 切成 [段首, 下一个段首) 的片段
+    idx = []
+    for h in heads:
+        p = full.find(h)
+        if p >= 0:
+            idx.append((p, h))
+    idx.sort()
+    def seg(a, b):
+        s = full.find(a)
+        e = full.find(b) if b else len(full)
+        return full[s:e].strip() if s >= 0 else ""
+    if kind == "table":
+        return seg("## 总体评价", "## 严重与高危问题详述")
+    if kind == "detail":
+        return seg("## 严重与高危问题详述", "## 安全性专项检查")
+    if kind == "sections":
+        return seg("## 安全性专项检查", "## 结论与放行建议")
+    if kind == "verdict":
+        return seg("## 结论与放行建议", None)
+    return full
+
+
 def report_text(tracking=None) -> str:
     rows = "\n".join(
         f"| {i} | {lv} | {loc} | {desc} | {cause} | {cons} | 改成参数化并统一校验 |"
@@ -128,7 +156,7 @@ CHUNK_TEXT = """### 一、本批问题清单
 
 | 编号 | 级别 | 文件:行号 | 问题描述 | 成因 | 后果 | 修改建议 | 证据 |
 | --- | --- | --- | --- | --- | --- | --- |
-| 1 | 高危 | app/main.py:10 | 本批 SQL 拼接 | 直接拼参数 | 可读全库 | 参数化 |
+| 1 | 高危 | app/main.py:10 | 本批 SQL 拼接 | 直接拼参数 | 可读全库 | 参数化 | | 代码事实 main.py:10 |
 
 ### 二、严重与高危问题的代码片段
 见问题清单。
@@ -161,7 +189,16 @@ class FakeProvider:
                 raise B.LLM.LLMError("HTTP 401 无效的 API Key")
         if self.delay:
             time.sleep(self.delay)
-        if "未通过结构校验" in prompt:
+        # 顺序要紧：第 2 段的提示词里也提到「第 1 段」（指已输出的内容）
+        if "第 4 段" in prompt:
+            text = report_part("verdict", self.tracking)
+        elif "第 3 段" in prompt:
+            text = report_part("sections", self.tracking)
+        elif "第 2 段" in prompt:
+            text = report_part("detail", self.tracking)
+        elif "第 1 段" in prompt:
+            text = report_part("table", self.tracking)
+        elif "未通过结构校验" in prompt:
             text = report_text(self.tracking)
         elif "分批代码审核的第" in prompt:
             text = CHUNK_TEXT
@@ -683,6 +720,31 @@ def main():
         check("无重复时为 0", B.count_duplicate_issues(
             "| 1 | 严重 | a.py:1 | 问题一 | x | y | z | w |\n"
             "| 2 | 高 | b.py:2 | 问题二 | x | y | z | w |\n") == 0)
+    finally:
+        env.close()
+
+    # ================= S16 报告分段生成（不撞 max_tokens）=================
+    env = Env()
+    try:
+        env.add_task("msg_s16", "代码审核 - 分段", SMALL)
+        env.run("msg_s16")
+        t = B.load_task("msg_s16")
+        md = (Path(t["report"]) / "代码审核报告.md").read_text(encoding="utf-8")
+        kinds = [k for k, _ in B.REPORT_PARTS]
+        check("报告分了 5 段（清单由本地生成，不在段里）", len(kinds) == 5, str(kinds))
+        check("清单段不在模型分段里（本地生成，避免超限）",
+              "table" not in kinds, str(kinds))
+        seg_calls = [p for p in env.provider.prompts if "第 " in p and "段" in p]
+        check("每段各调用一次模型（而不是一次写完整份）", len(seg_calls) >= 4,
+              str(len(seg_calls)))
+        for title in ("总体评价", "问题清单", "严重与高危问题详述",
+                      "安全性专项检查", "架构与可维护性", "测试与工程化",
+                      "结论与放行建议"):
+            check(f"分段拼接后含章节「{title}」", title in md, "")
+        check("分段拼接后结构校验通过", B.validate_report(md, 3) == [],
+              str(B.validate_report(md, 3)))
+        check("分段生成没有重复问题", B.count_duplicate_issues(md) == 0,
+              str(B.count_duplicate_issues(md)))
     finally:
         env.close()
 
