@@ -16,9 +16,11 @@
   E. 回信摘要与状态展示
   F. 无基线时不改变原有行为
 """
+import io
 import shutil
 import sys
 import tempfile
+import types
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -174,6 +176,11 @@ def main():
     last = mk_task("msg_r2b", "代码审核 - cycle（第3轮）", 900, state="SEEN",
                    with_report=False)
     check("多轮历史取最近一轮", (B.find_baseline(last) or {}).get("message_id") == "msg_r1b")
+
+    check("清完后只剩有任务对应的指纹",
+          sorted(f.stem for f in B.FP_DIR.glob("*.json"))
+          <= sorted(p.stem for p in B.TASKS.glob("*.json")),
+          str([f.stem for f in B.FP_DIR.glob("*.json")]))
 
     # ---------- C2. 主题归一规则（复审能不能匹配上）----------
     same = [
@@ -343,6 +350,76 @@ def main():
     check("issue_file 取路径", B.issue_file("`app/main.py:120-160`") == "app/main.py",
           B.issue_file("`app/main.py:120-160`"))
 
+    # ---------- B2. 内容匹配（不靠邮件标题）----------
+    FP_BASE = TMP / "fp_case"
+    def _mk_src(dst, files):
+        dst.mkdir(parents=True, exist_ok=True)
+        for name, text in files.items():
+            p = dst / name
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(text, encoding="utf-8")
+        return dst
+
+    proj = {f"backend/m{i}.py": f"def f{i}():\n    return {i}\n" for i in range(15)}
+    proj.update({"README.md": "说明\n",
+                 "package.json": "{}"})
+    src_a = _mk_src(FP_BASE / "a", proj)
+
+    # 同一份代码：外层目录变了 + 改了 2 个文件 + **标题完全不同**
+    proj2 = dict(proj)
+    proj2["backend/m0.py"] = "def f0():\n    return 99  # fixed\n"
+    proj2["backend/m1.py"] = "def f1():\n    return 98  # fixed\n"
+    src_b = _mk_src(FP_BASE / "b" / "outer-v2", proj2)
+
+    fp_a = B.fingerprint_src(src_a)
+    fp_b = B.fingerprint_src(src_b)
+    sim, detail = B.content_similarity(fp_a, fp_b)
+    check("同一份代码改两处 -> 相似度很高", sim > 0.7, f"sim={sim:.2f} {detail}")
+    check("外壳目录不同不影响路径比对", detail.get("path") == 1.0, str(detail))
+
+    other = {f"src/svc{i}.java": f"class S{i} {{}}\n" for i in range(10)}
+    src_c = _mk_src(FP_BASE / "c", other)
+    sim2, _ = B.content_similarity(B.fingerprint_src(src_c), fp_a)
+    check("不同项目 -> 相似度接近 0", sim2 < 0.2, f"{sim2:.2f}")
+
+    # 走完整流程：不同标题也能认出上一轮（用独立任务目录，别影响前面的用例）
+    fp_tasks = TMP / "fp_tasks"
+    fp_tasks.mkdir(parents=True, exist_ok=True)
+    _old_tasks, _old_fp = B.TASKS, B.FP_DIR
+    B.TASKS = fp_tasks
+    B.FP_DIR = fp_tasks / "fp"
+    B.FP_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        mk_task("msg_fp1", "代码审核 - 完全不同的标题 A", 1000,
+                state="REPLIED", with_report=True)
+        B.save_fp("msg_fp1", fp_a)
+        cur_fp = mk_task("msg_fp2", "代码审核 - 标题随便写 (第2轮) whatever", 2000,
+                      state="SEEN", with_report=False)
+        got = B.find_baseline_by_content(cur_fp, src_b)
+        check("内容匹配能认出不同标题的上一轮", got and got[0]["message_id"] == "msg_fp1",
+              str(got[0] and got[0]["message_id"]))
+        check("内容匹配带相似度说明", (got[1] or {}).get("via") == "content", str(got[1]))
+        got2 = B.find_baseline_by_content(cur_fp, src_c)
+        check("不同项目不会被内容匹配误认", got2[0] is None, str(got2[1]))
+
+        # prepare_baseline 优先内容、再兜底主题
+        bl = B.prepare_baseline(cur_fp, src=src_b)
+        m = (bl or {}).get("match") or {}
+        check("prepare_baseline 走内容匹配", m.get("via") == "content", str(m))
+        check("prepare_baseline 拿到上一轮清单", (bl or {}).get("total") == 3,
+              str((bl or {}).get("total")))
+        # 指纹不能无限堆积：任务没了，指纹也要跟着清
+        # （必须在临时 FP_DIR 里验，别写到真实 state/fp）
+        (B.FP_DIR / "msg_gone.json").write_text("{}", encoding="utf-8")
+        check("孤儿指纹会被清掉", B.prune_orphan_fps() >= 1,
+              str(sorted(f.stem for f in B.FP_DIR.glob("*.json"))))
+        check("被清掉的是孤儿，不是活任务的指纹",
+              not (B.FP_DIR / "msg_gone.json").exists()
+              and (B.FP_DIR / "msg_fp1.json").exists(),
+              str(sorted(f.stem for f in B.FP_DIR.glob("*.json"))))
+    finally:
+        B.TASKS, B.FP_DIR = _old_tasks, _old_fp
+
     # ---------- F. 回信摘要 / 行为不变 ----------
     rpt_dir = B.WORK / "msg_r1" / "report"
     (rpt_dir / "summary.md").write_text("本轮共 5 项问题。", encoding="utf-8")
@@ -372,6 +449,63 @@ def main():
     t2 = B.load_task("msg_r2")
     check("CLI --baseline <id> 指定基线",
           t2.get("baseline_mid") == "msg_r0" and not t2.get("regression_skip"))
+
+
+    # ---------- H. 分数回填：历史报告也要能用同一把尺比 ----------
+    def _quiet(fn, *a, **kw):
+        """cmd_score 会打印明细，测试里别把输出搅乱"""
+        buf = io.StringIO()
+        try:
+            with_stdout = __import__("contextlib").redirect_stdout(buf)
+            with with_stdout:
+                return fn(*a, **kw), buf.getvalue()
+        except SystemExit:
+            return None, buf.getvalue()
+
+    mk_task("msg_sc1", "代码审核 - 评分回填", 5000)     # 报告里有 严重/高危/中危 各 1 条
+    _out, printed = _quiet(B.cmd_score, types.SimpleNamespace(id="msg_sc1"))
+    t1 = B.load_task("msg_sc1")
+    det = t1.get("score_detail") or {}
+    check("cmd_score 把分数写回任务", isinstance(t1.get("score"), int),
+          str(t1.get("score")))
+    check("分数带口径版本（多轮才能判断是否可比）",
+          det.get("version") == B.scoring_version(), str(det))
+    check("级别分布被记下来", det.get("counts", {}).get("严重") == 1, str(det.get("counts")))
+    check("有严重问题 -> 档位是不建议放行", det.get("verdict") == "不建议放行",
+          str(det.get("verdict")))
+    check("重算结果与直接算一致",
+          t1["score"] == B.compute_score(B.extract_issue_rows(
+              (B.WORK / "msg_sc1" / "report" / "代码审核报告.md")
+              .read_text(encoding="utf-8")))["score"], str(t1["score"]))
+
+    # 报告格式坏了：不能因为「解析不出问题」就发满分
+    mk_task("msg_sc_bad", "代码审核 - 坏报告", 5001,
+            report_text="# 代码审核报告\n\n（清单缺失）\n")
+    _quiet(B.cmd_score, types.SimpleNamespace(id="msg_sc_bad"))
+    check("解析不出问题行时不写满分",
+          B.load_task("msg_sc_bad").get("score") is None,
+          str(B.load_task("msg_sc_bad").get("score")))
+
+    # 上一轮也按同口径重算，否则「上轮分」还是模型自评分，对比照样没意义
+    mk_task("msg_sc_base", "代码审核 - 基线项目", 4000)
+    t2 = mk_task("msg_sc2", "代码审核 - 基线项目（第2轮）", 5100)
+    t2["baseline_mid"] = "msg_sc_base"
+    B.save_task(t2)
+    _quiet(B.cmd_score, types.SimpleNamespace(id="msg_sc2"))
+    check("回填时一并重算上一轮的分数",
+          isinstance(B.load_task("msg_sc2").get("score_prev"), int),
+          str(B.load_task("msg_sc2").get("score_prev")))
+    check("两轮口径版本一致",
+          (B.load_task("msg_sc2").get("score_detail") or {}).get("version")
+          == B.scoring_version())
+
+    # 全量模式：不给 --id 就扫所有有报告的任务，且不会因个别坏报告中断
+    rc, out = _quiet(B.cmd_score, types.SimpleNamespace(id=None))
+    check("全量回填返回 0（不被坏报告打断）", rc == 0, str(rc))
+    check("全量回填会跳过并说明坏报告", "跳过" in out, out[-200:])
+    check("全量回填后旧任务也有分数",
+          isinstance(B.load_task("msg_r1").get("score"), int),
+          str(B.load_task("msg_r1").get("score")))
 
     print(f"\n{PASS}/{PASS + FAIL} 通过")
     return 0 if FAIL == 0 else 1

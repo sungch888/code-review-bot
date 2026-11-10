@@ -693,6 +693,24 @@ def page_task(mid: str, flash: str = "", err: bool = False) -> str:
         id_rows += (f'<div class="k">回归核对</div><div class="mono">基线 '
                     f'{esc(str(t.get("baseline_mid")))}（第 {esc(t.get("baseline_round") or 1)} 轮，'
                     f'{esc(t.get("baseline_issue_count") or 0)} 条旧问题）</div>')
+    # 评分（统一口径）：本轮 + 上轮同口径重算 -> 变化
+    score_html = ""
+    if t.get("score") is not None:
+        ver = (t.get("score_detail") or {}).get("version", "")
+        cnt = (t.get("score_detail") or {}).get("counts") or {}
+        dist = "、".join(f"{k} {v}" for k, v in cnt.items() if v)
+        delta = ""
+        if t.get("score_prev") is not None:
+            d = int(t["score"]) - int(t["score_prev"])
+            arrow = "↑" if d > 0 else ("↓" if d < 0 else "→")
+            color = "#30d158" if d > 0 else ("#ff453a" if d < 0 else "#8e8e93")
+            delta = (f'<div class="k">同口径变化</div><div style="color:{color}">'
+                     f'{esc(t["score_prev"])} → {esc(t["score"])} '
+                     f'（{arrow}{abs(d)}）</div>')
+        score_html = (f'<div class="k">评分</div><div><b>{esc(t["score"])}</b> / 100'
+                      f'<span class="sub">（口径 v{esc(ver)}：{esc(dist)}）</span></div>'
+                      + delta)
+
     tr = t.get("tracking") or {}
     track_html = ""
     if tr.get("total"):
@@ -776,6 +794,7 @@ def page_task(mid: str, flash: str = "", err: bool = False) -> str:
     <div class="k">发件人</div><div>{esc(t.get('from_name'))} &lt;{esc(t.get('from'))}&gt;</div>
     <div class="k">时间</div><div>{fmt_time(t.get('created_at'))}</div>
     {id_rows}
+    {score_html}
     <div class="k">尝试次数</div><div>{esc(t.get('attempts', 0))}</div>
     <div class="k">已回复</div><div>{fmt_time(t.get('replied_at'))}</div>
     {ack_line}
@@ -1144,7 +1163,8 @@ class Handler(BaseHTTPRequestHandler):
                     "tasks": [
                         {k: t.get(k) for k in
                          ("message_id", "subject", "state", "attempts", "created_at",
-                          "replied_at", "last_error")}
+                          "replied_at", "last_error", "score", "score_prev",
+                          "review_round", "baseline_mid")}
                         for t in tasks()
                     ],
                 }, ensure_ascii=False, indent=2), "application/json; charset=utf-8")

@@ -309,6 +309,60 @@ def main():
 
         check("配置示例里有 download_cookie", "download_cookie" in
               (BASE / "config.example.json").read_text(encoding="utf-8"), "")
+
+        # ---------- D. zip 里的中文文件名（GBK 名字被按 cp437 解成乱码）----------
+        cn = "\u5f00\u53d1\u8005\u6d4b\u8bd5\u4e0e\u4f7f\u7528\u8bf4\u660e\u4e66.md"
+        mojibake = cn.encode("gbk").decode("cp437")     # zipfile 没拿到 UTF-8 标志时的下场
+        check("构造出的乱码确实不可读", any(ord(c) > 127 for c in mojibake)
+              and mojibake != cn, repr(mojibake))
+        check("乱码中文文件名能修回可读中文", B.fix_zip_name(mojibake) == cn,
+              repr(B.fix_zip_name(mojibake)))
+        check("正常中文名不会被误改", B.fix_zip_name(cn) == cn, repr(B.fix_zip_name(cn)))
+        check("纯 ASCII 路径原样返回",
+              B.fix_zip_name("src/app/main.py") == "src/app/main.py")
+
+        class _Info:
+            def __init__(self, name, size=10):
+                self.filename = name
+                self.file_size = size
+
+        class _ZF:
+            """只实现 safe_extract_zip 用到的接口，顺便记录解压结果"""
+
+            def __init__(self, infos):
+                self._infos = infos
+                self.out = []
+
+            def infolist(self):
+                return self._infos
+
+            def extract(self, member, dest):
+                self.out.append(str(member.filename))
+
+        infos = [_Info(mojibake), _Info(cn), _Info("../evil.sh"), _Info("/abs.sh"),
+                 _Info(mojibake)]
+        zf = _ZF(infos)
+        B.safe_extract_zip(zf, tmp / "ext", [10 ** 6])
+        check("解压前先把乱码条目名修成可读中文",
+              zf.out and zf.out[0] == cn, str(zf.out))
+        check("修完撞名的条目跳过（不覆盖同名文件）", zf.out.count(cn) == 1, str(zf.out))
+        check("穿越路径仍然被拦住",
+              all("../" not in n and not n.startswith("/") for n in zf.out), str(zf.out))
+
+        # 代码包指纹：一个包名字正常、一个包名字乱码，也要能认出同一项目
+        p1 = tmp / "pkg_new"
+        p2 = tmp / "pkg_old"
+        for d in (p1, p2):
+            (d / "src").mkdir(parents=True, exist_ok=True)
+            (d / "src" / "a.py").write_text("print(1)", encoding="utf-8")
+        (p1 / cn).write_text("x", encoding="utf-8")
+        (p2 / mojibake).write_text("x", encoding="utf-8")
+        fa = B.fingerprint_src(p1)
+        fb = B.fingerprint_src(p2)
+        check("乱码包和正常包算出的路径集合一致（复审匹配不掉分）",
+              set(fa["paths"]) == set(fb["paths"]), f"{fa['paths']} vs {fb['paths']}")
+        sc, _det = B.content_similarity(fa, fb)
+        check("乱码包与正常包相似度为 1", sc > 0.99, f"{sc:.3f}")
     finally:
         srv.shutdown()
         import shutil

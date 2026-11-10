@@ -1016,12 +1016,48 @@ class Lock:
 
 
 # ---------------------------------------------------------------- download/extract
+def fix_zip_name(name: str) -> str:
+    """修正 zip 里未标 UTF-8 标志的中文文件名
+
+    Windows 自带的「压缩到 zip」写的是 GBK 名字且不置 UTF-8 标志，
+    zipfile 只能按 cp437 解，结果就变成 `Õ⌐Φ╪▒Ñ...` 这种乱码。
+    不修的话有两层实际危害：
+      1. 报告里引用的路径是乱码，开发者对不上自己哪个文件；
+      2. 同一个项目两次上传，一次名字正常一次乱码，代码包指纹会当成
+         不同文件，复审匹配度白掉一截。
+    已经标了 UTF-8 的名字含中文，无法 encode('cp437')，会原样返回。
+    """
+    try:
+        raw = name.encode("cp437")
+    except UnicodeEncodeError:
+        return name
+    if raw == name.encode("ascii", "ignore") and not any(ord(c) > 127 for c in name):
+        return name                      # 纯 ASCII，本来就没问题
+    for enc in ("gbk", "big5", "shift_jis"):
+        try:
+            fixed = raw.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+        if fixed != name:
+            return fixed
+    return name
+
+
 def safe_extract_zip(zf: zipfile.ZipFile, dest: Path, budget):
+    seen = set()
+    dup = 0
     for member in zf.infolist():
+        fixed = fix_zip_name(member.filename)
+        if fixed != member.filename:
+            member.filename = fixed
         name = member.filename
         if name.startswith("/") or ".." in Path(name).parts:
             log(f"跳过可疑路径: {name}", "WARN")
             continue
+        if name in seen:                  # 修完乱码后可能跟另一个条目撞名
+            dup += 1
+            continue
+        seen.add(name)
         budget[0] -= member.file_size
         if budget[0] <= 0:
             raise RuntimeError("解压体积超限")
@@ -1029,6 +1065,8 @@ def safe_extract_zip(zf: zipfile.ZipFile, dest: Path, budget):
             zf.extract(member, dest)
         except Exception as e:
             log(f"解压条目失败 {name}: {e}", "WARN")
+    if dup:
+        log(f"zip 里有 {dup} 个条目修正文件名后重名，已跳过后者", "WARN")
 
 
 def safe_extract_tar(tf: tarfile.TarFile, dest: Path, budget):
@@ -1229,6 +1267,183 @@ def baseline_report_path(task: dict):
         if p.stat().st_size >= 50:
             return p
     return None
+
+
+# ---------------------------------------------------------------- 代码包指纹
+# 复审识别**不靠邮件标题**：标题太容易改（"修复后重新送审"、"【已修复】"、加日期…），
+# 用户记不住格式就会静默降级成"全新项目"。改成认**代码包内容**：
+# 同一份代码重新打包（文件名/外层目录变了），路径集合与文件内容仍然高度重合。
+FP_DIR = STATE / "fp"
+FP_MAX_PATHS = 600          # 记多少条相对路径（够判断结构）
+FP_MAX_SIGS = 400           # 记多少个文件内容签名（按体积从大到小取）
+
+
+def _norm_rel_paths(src: Path, files) -> list:
+    """归一化相对路径：去掉所有文件共有的最外层目录
+
+    重新打包时常出现外壳目录变化（`proj-main/` -> `proj-main (1)/`），
+    不归一化会让路径集合完全对不上。
+    """
+    rels = []
+    for f in files:
+        try:
+            # 历史上已经解压出来的乱码名字在这里兜底修正，
+            # 新旧代码包才能用同一套路径比
+            rels.append(fix_zip_name(f.relative_to(src).as_posix()))
+        except Exception:
+            continue
+    if not rels:
+        return []
+    parts = [r.split("/") for r in rels]
+    common = []
+    for segs in zip(*parts[:50]):        # 只看前 50 个文件估计公共前缀，避免长尾
+        if len(set(segs)) == 1 and all(len(p) > len(common) + 1 for p in parts[:50]):
+            common.append(segs[0])
+        else:
+            break
+    if common:
+        n = len(common)
+        rels = ["/".join(p[n:]) if len(p) > n else "/".join(p) for p in parts]
+        rels = [r for r in rels if r]
+    return sorted(set(rels))
+
+
+def _file_sig(path: Path) -> str:
+    """文件内容签名：前 64KB 的 sha1（够区分，且大文件也不必全读）"""
+    import hashlib
+    h = hashlib.sha1()
+    try:
+        with open(path, "rb") as f:
+            h.update(f.read(64 * 1024))
+    except Exception:
+        return ""
+    return h.hexdigest()[:16]
+
+
+def fingerprint_src(src: Path, files=None) -> dict:
+    """给代码包算一个可比较的指纹（路径集合 + 大文件内容签名）"""
+    files = list(files if files is not None else
+                 collect_source_files(src, CONFIG["max_review_files"]))
+    paths = _norm_rel_paths(src, files)
+    by_size = sorted(files, key=lambda f: -_safe_size(f))[:FP_MAX_SIGS]
+    sigs = [s for s in (_file_sig(f) for f in by_size) if s]
+    total = sum(_safe_size(f) for f in files)
+    return {"paths": paths[:FP_MAX_PATHS], "sigs": sorted(set(sigs)),
+            "n": len(files), "bytes": total}
+
+
+def _safe_size(p: Path) -> int:
+    try:
+        return p.stat().st_size
+    except Exception:
+        return 0
+
+
+def fp_path(mid: str) -> Path:
+    return FP_DIR / f"{mid}.json"
+
+
+def save_fp(mid: str, fp: dict) -> None:
+    try:
+        FP_DIR.mkdir(parents=True, exist_ok=True)
+        fp_path(mid).write_text(json.dumps(fp, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        log(f"[{mid}] 保存代码包指纹失败（不影响审核）: {e}", "WARN")
+
+
+def load_fp(mid: str) -> dict:
+    try:
+        return json.loads(fp_path(mid).read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def prune_orphan_fps() -> int:
+    """删掉没有对应任务的代码包指纹
+
+    指纹是每次审核新增一个文件，任务被清掉/换机器时不会跟着消失，
+    不管它就会无限堆。只认 state/tasks 里还在的任务 id。
+    """
+    n = 0
+    try:
+        if not FP_DIR.exists():
+            return 0
+        alive = {p.stem for p in TASKS.glob("*.json")}
+        for f in FP_DIR.glob("*.json"):
+            if f.stem in alive:
+                continue
+            try:
+                f.unlink()
+                n += 1
+            except Exception as e:
+                log(f"删除孤儿指纹失败 {f.name}: {e}", "WARN")
+        if n:
+            log(f"清理孤儿代码包指纹 {n} 个")
+    except Exception as e:
+        log(f"清理孤儿指纹失败（不影响运行）: {e}", "WARN")
+    return n
+
+
+def content_similarity(a: dict, b: dict) -> tuple:
+    """两个代码包的相似度 -> (score 0..1, 明细)"""
+    if not a or not b:
+        return 0.0, {}
+    pa, pb = set(a.get("paths") or []), set(b.get("paths") or [])
+    sa, sb = set(a.get("sigs") or []), set(b.get("sigs") or [])
+    path_j = len(pa & pb) / len(pa | pb) if (pa or pb) else 0.0
+    inter_s = len(sa & sb)
+    content = inter_s / max(1, min(len(sa), len(sb))) if (sa or sb) else 0.0
+    # 路径反映结构（改名/挪目录会掉），内容反映同一批文件（改代码会掉）
+    score = 0.6 * path_j + 0.4 * content
+    return score, {"path": round(path_j, 3), "content": round(content, 3),
+                   "shared_paths": len(pa & pb), "shared_files": inter_s,
+                   "files": min(a.get("n") or 0, b.get("n") or 0)}
+
+
+def content_baseline_threshold() -> float:
+    try:
+        return float(CONFIG.get("baseline_similarity", 0.5) or 0.5)
+    except (TypeError, ValueError):
+        return 0.5
+
+
+def find_baseline_by_content(task: dict, src: Path, tasks=None):
+    """按**代码包内容**找上一轮（同一份代码重新提交，标题怎么写都认得出）"""
+    if task.get("regression_skip"):
+        return None, None
+    if not CONFIG.get("regression_review", True):
+        return None, None
+    fp = fingerprint_src(src)
+    if not fp.get("paths") or fp.get("n", 0) < 2:
+        return None, None
+    mid = task.get("message_id")
+    cur_ts = task.get("created_at_ts") or 0
+    pool = tasks if tasks is not None else all_tasks()
+    best, best_score, best_detail = None, 0.0, {}
+    for t in pool:
+        if t.get("message_id") == mid:
+            continue
+        if (t.get("state") or "").upper() not in (State.REPLIED, State.REVIEWED):
+            continue
+        if cur_ts and (t.get("created_at_ts") or 0) > cur_ts:
+            continue
+        if baseline_report_path(t) is None:
+            continue
+        other = load_fp(t.get("message_id", "")) or t.get("fp") or {}
+        if not other:
+            continue
+        score, detail = content_similarity(fp, other)
+        detail["mid"] = t.get("message_id")
+        if score > best_score:
+            best, best_score, best_detail = t, score, detail
+    thr = content_baseline_threshold()
+    if best is None or best_score < thr:
+        return None, {"best": best_detail, "score": round(best_score, 3), "threshold": thr}
+    # 太小/共享文件太少的项目不做内容匹配，避免"两个脚手架"互相误配
+    if best_detail.get("shared_paths", 0) < 3 and best_detail.get("shared_files", 0) < 3:
+        return None, {"best": best_detail, "score": round(best_score, 3),
+                      "threshold": thr, "reason": "共享文件太少"}
+    return best, {"score": round(best_score, 3), "via": "content", **best_detail}
 
 
 def find_baseline(task: dict, tasks=None):
@@ -1596,9 +1811,30 @@ def tracking_line(tr: dict, new_count: int = 0) -> str:
     return s
 
 
-def prepare_baseline(task: dict, tasks=None):
-    """找出上一轮任务并抽出待核对清单；没有基线就返回 None"""
-    base = find_baseline(task, tasks)
+def prepare_baseline(task: dict, tasks=None, src: Path = None):
+    """找出上一轮任务并抽出待核对清单；没有基线就返回 None
+
+    匹配顺序：
+      1. 显式指定（task['baseline_mid'] / --baseline）
+      2. **代码包内容**（同一份代码重新提交，标题怎么写都认得出）
+      3. 邮件主题（内容改动很大时兜底；要求标题保持一致）
+
+    返回的 dict 里带 match 字段，说明是靠什么认出来的、相似度多少。
+    """
+    base, match = None, {}
+    explicit = (task.get("baseline_mid") or "").strip()
+    if explicit:
+        base = find_baseline(task, tasks)
+        match = {"via": "explicit"}
+    if base is None and src is not None and src.exists():
+        base, match = find_baseline_by_content(task, src, tasks)
+        if base is None and match:
+            log(f"[{task.get('message_id')}] 代码包内容未匹配到已知项目"
+                f"（最高相似度 {match.get('score')}，阈值 {match.get('threshold')}）")
+    if base is None:
+        base = find_baseline(task, tasks)
+        if base is not None:
+            match = {"via": "subject", "score": 1.0}
     if base is None:
         return None
     md = baseline_report_path(base)
@@ -1610,7 +1846,8 @@ def prepare_baseline(task: dict, tasks=None):
     prev = int(base.get("review_round") or round_of(base.get("subject", "")) or 1)
     cur = int(task.get("review_round") or 0) or (prev + 1)
     return {"mid": base.get("message_id"), "prev_round": prev, "round": max(cur, prev + 1),
-            "items": items, "total": len(items), "omitted": max(0, raw_total - len(items))}
+            "items": items, "total": len(items), "omitted": max(0, raw_total - len(items)),
+            "match": match}
 
 
 def apply_baseline_choice(mid: str, choice) -> None:
@@ -2924,6 +3161,13 @@ def review_pipeline(mid: str, src: Path, rpt: Path, files, extra: str, warnings:
     rest = re.sub(r"^###\s+(总体评价|问题清单|上轮问题跟踪|严重与高危问题详述|"
                   r"安全性专项检查|架构与可维护性|测试与工程化|验证方式|结论与放行建议)"
                   r"\s*$", r"## \1", rest, flags=re.M)
+    # ---- 评分：按统一口径算（不用模型自评的数字）----
+    score_res = compute_score(merged_rows)
+    if overview:
+        overview = rewrite_score_in_report(overview, score_res)
+    log(f"[{mid}] 评分（口径 v{score_res['version']}）: {score_res['score']} 分 "
+        f"（{score_res['counts']}，建议档位: {score_res['verdict'] or '-'}）")
+
     final = []
     if overview:
         final.append("## 总体评价\n\n" + overview)
@@ -3004,6 +3248,124 @@ def missing_report_parts(md_text: str) -> list:
         if not any(t in heads for t in titles):
             missing.append(kind)
     return missing
+
+
+
+# ---------------------------------------------------------------- 评分口径（确定性）
+# 分数**不由模型自评**：模型每轮自己写一个数字，两轮之间不可比，
+# 会出现「修了一堆问题，分数反而更低」——开发者看到只会觉得工具在耍他。
+# 这里按 templates/scoring.json 的统一口径，从问题清单的级别分布算分；
+# 多轮对比时，上一轮也用同一口径从其报告重算，保证两把尺子完全一样。
+SCORING_PATH = BASE / "templates" / "scoring.json"
+try:
+    SCORING = json.loads(SCORING_PATH.read_text(encoding="utf-8"))
+except Exception as _e:      # 配置坏了也要能出分，用内置默认
+    log(f"评分口径文件读取失败({_e})，使用内置默认口径", "WARN")
+    SCORING = {"version": 0, "base": 100, "floor": 0, "curvature": "log2",
+               "severity_weights": {"严重": 10, "高危": 4, "高": 4, "中危": 2, "中": 2,
+                                    "低危": 1, "低": 1},
+               "verdict_rules": [{"if_critical_gte": 1, "verdict": "不建议放行"},
+                                 {"if_high_gte": 5, "verdict": "修改后放行"},
+                                 {"if_score_lt": 70, "verdict": "修改后放行"},
+                                 {"else": "可放行"}]}
+
+_SEV_ORDER = ("严重", "高危", "中危", "低危")
+
+
+def _sev_key(level: str) -> str:
+    """把各种级别写法归一到四档（严重/高危/中危/低危）"""
+    s = str(level or "").strip()
+    if "严重" in s:
+        return "严重"
+    if "高" in s:
+        return "高危"
+    if "中" in s:
+        return "中危"
+    if "低" in s:
+        return "低危"
+    return ""
+
+
+def scoring_version() -> int:
+    try:
+        return int(SCORING.get("version") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def compute_score(rows) -> dict:
+    """按统一口径算分：返回 score / 分布 / 扣分明细 / 建议档位
+
+    扣分 = Σ 权重(级别) × log2(1 + 该级别条数)
+    用 log 是因为「批次切得细 -> 问题条数变多」不该让分数暴跌，
+    真正决定分数的是**严重度分布**。
+    """
+    import math
+    weights = SCORING.get("severity_weights") or {}
+    counts = {k: 0 for k in _SEV_ORDER}
+    for r in rows or []:
+        k = _sev_key(r.get("level"))
+        if k:
+            counts[k] += 1
+    base = float(SCORING.get("base") or 100)
+    floor = float(SCORING.get("floor") or 0)
+    curvature = (SCORING.get("curvature") or "log2").lower()
+    detail, penalty = {}, 0.0
+    for sev, n in counts.items():
+        w = float(weights.get(sev, 0) or 0)
+        if not n or not w:
+            detail[sev] = {"count": n, "penalty": 0.0}
+            continue
+        factor = math.log2(1 + n) if curvature == "log2" else float(n)
+        p = w * factor
+        detail[sev] = {"count": n, "penalty": round(p, 1)}
+        penalty += p
+    score = max(floor, round(base - penalty))
+    verdict = ""
+    for rule in SCORING.get("verdict_rules") or []:
+        if "if_critical_gte" in rule and counts["严重"] >= int(rule["if_critical_gte"]):
+            verdict = rule["verdict"]
+            break
+        if "if_high_gte" in rule and counts["高危"] >= int(rule["if_high_gte"]):
+            verdict = rule["verdict"]
+            break
+        if "if_score_lt" in rule and score < float(rule["if_score_lt"]):
+            verdict = rule["verdict"]
+            break
+        if rule.get("else"):
+            verdict = rule["else"]
+            break
+    return {"score": score, "counts": counts, "detail": detail,
+            "penalty": round(penalty, 1), "verdict": verdict,
+            "version": scoring_version(), "total": sum(counts.values())}
+
+
+def render_score_line(res: dict) -> str:
+    """一行说清分数怎么来的（两轮之间的「同一把尺」就靠它）"""
+    parts = []
+    for sev in _SEV_ORDER:
+        d = (res.get("detail") or {}).get(sev) or {}
+        n = d.get("count") or 0
+        if n:
+            parts.append(f"{sev} {n} 条（-{d.get('penalty', 0):g}）")
+    body = "、".join(parts) if parts else "未发现问题"
+    return (f"整体质量评分：**{res['score']}** / 100"
+            f"（统一口径 v{res.get('version')}：{body}，合计 -{res.get('penalty', 0):g} 分）")
+
+
+def rewrite_score_in_report(text: str, res: dict) -> str:
+    """把报告里模型自评的分数替换成系统算的分数（保留模型的评分依据叙述）"""
+    line = render_score_line(res)
+    pat = re.compile(r"[^\n]{0,40}(?:整体质量评分|质量评分|评分|得分)[^\n]{0,10}?"
+                     r"\*{0,2}\s*\d{1,3}\s*(?:/\s*100)?\s*\*{0,2}[^\n]*")
+    if pat.search(text):
+        return pat.sub(line, text, count=1)
+    return text.rstrip() + "\n" + line + "\n"
+
+
+def score_of_report(md_text: str) -> dict:
+    """从一份历史报告重算分数（用**同一口径**，让多轮对比有意义）"""
+    return compute_score(extract_issue_rows(md_text))
 
 
 def count_duplicate_issues(md_text: str) -> int:
@@ -3123,6 +3485,33 @@ def run_review(task, extra: str = "", baseline: dict = None) -> Path:
                         "请对照代码去重后再看")
         log(f"[{mid}] 报告里有 {dup} 条重复问题", "WARN")
     task["new_issues"] = len(extract_issue_rows(final_txt))
+    # 评分：统一口径（多轮对比时，上一轮也用同一口径重算）
+    try:
+        _verdicts = ("可放行", "修改后放行", "不建议放行")
+        _model_v = next((v for v in _verdicts if v in final_txt), "")
+        _calc_v = compute_score(extract_issue_rows(final_txt))["verdict"]
+        if _model_v and _calc_v and _model_v != _calc_v:
+            warnings.append(f"结论档位（{_model_v}）与统一口径计算结果（{_calc_v}）不一致，"
+                            "以口径为准")
+            log(f"[{mid}] 档位不一致：报告写 {_model_v}，口径算出 {_calc_v}（以口径为准）",
+                "WARN")
+        cur_score = compute_score(extract_issue_rows(final_txt))
+        task["score"] = cur_score["score"]
+        task["score_detail"] = {"version": cur_score["version"],
+                                "counts": cur_score["counts"],
+                                "penalty": cur_score["penalty"],
+                                "verdict": cur_score["verdict"]}
+        if baseline:
+            base_md = baseline_report_path(load_task(baseline["mid"]) or {})
+            if base_md is not None:
+                prev = score_of_report(base_md.read_text(encoding="utf-8", errors="replace"))
+                task["score_prev"] = prev["score"]
+                task["score_prev_counts"] = prev["counts"]
+                log(f"[{mid}] 同口径对比：上轮 {prev['score']} 分 -> 本轮 "
+                    f"{cur_score['score']} 分（Δ{cur_score['score'] - prev['score']:+d}）")
+    except Exception as e:
+        warnings.append(f"评分计算失败：{e}")
+        log(f"[{mid}] 评分计算失败: {e}", "WARN")
     if baseline:
         tr = parse_tracking(final_txt)
         task["tracking"] = tr
@@ -3437,7 +3826,11 @@ def review_existing(mid: str, reply: bool = False) -> str:
     extra = render_requirements(reqs)
     t["requirements_effective"] = [{"source": s, "text": x} for s, x in reqs]
     ensure_identity(t)
-    baseline = prepare_baseline(t)
+    try:
+        save_fp(mid, fingerprint_src(src))
+    except Exception as e:
+        log(f"[{mid}] 计算代码包指纹失败（不影响审核）: {e}", "WARN")
+    baseline = prepare_baseline(t, src=src)
     if baseline:
         t["baseline_mid"] = baseline["mid"]
         t["baseline_round"] = baseline["prev_round"]
@@ -3527,7 +3920,23 @@ def build_body(task, report_dir: Path, files) -> str:
     tr = task.get("tracking") or {}
     if tr.get("total"):
         track.append("")
-        track.append(f"---- 上轮问题跟踪（第 {task.get('baseline_round', '前')} 轮） ----")
+        m = task.get("baseline_match") or {}
+        how = ""
+        if m.get("via") == "content":
+            how = (f"（按代码包内容匹配，结构相似度 {int((m.get('path') or 0) * 100)}%、"
+                   f"文件内容重合 {int((m.get('content') or 0) * 100)}%）")
+        elif m.get("via") == "explicit":
+            how = "（人工指定的基线）"
+        track.append(f"---- 上轮问题跟踪（第 {task.get('baseline_round', '前')} 轮）{how} ----")
+        if task.get("score") is not None and task.get("score_prev") is not None:
+            cur_s, prev_s = task.get("score"), task.get("score_prev")
+            delta = int(cur_s) - int(prev_s)
+            trend = "↑ 改善" if delta > 0 else ("↓ 变差" if delta < 0 else "→ 持平")
+            ver = (task.get("score_detail") or {}).get("version", "")
+            track.append(f"同口径评分（v{ver}）：上轮 {prev_s} 分 → 本轮 {cur_s} 分"
+                         f"（{delta:+d}，{trend}）")
+            track.append("两轮用**同一套口径**重算，所以这个变化可以直接比较；"
+                         "问题条数会随代码量与审核批次波动，分数只看严重度分布。")
         track.append(tracking_line(tr, task.get("new_issues") or 0))
         pend = (tr.get("unfixed_items") or [])[:5]
         if pend:
@@ -3545,8 +3954,10 @@ def build_body(task, report_dir: Path, files) -> str:
         track.append("---- 复审提示 ----")
         track.append("本次**未匹配到上一轮的审核报告**，因此按全新项目审核，"
                      "报告里没有「上轮问题跟踪」一节。")
-        track.append("若这确实是复审，请检查邮件标题是否与上一轮**保持一致**"
-                     "（只改「（第2轮）」这类轮次标记即可；其它文字变化会导致匹配失败）。")
+        track.append("识别依据是**代码包内容**（文件结构与文件内容），不是邮件标题——"
+                     "所以如果你确实提交的是同一份代码的修改版，说明改动幅度超过了匹配阈值。")
+        track.append("可以：① 把上一轮报告的问题清单放进正文 `【审核要求】`，"
+                     "让本次逐条核对；② 或联系我指定基线任务重新跑。")
 
     lines = [
         f"{task.get('from_name') or ''} 你好，",
@@ -3729,12 +4140,19 @@ def process_task(mid: str) -> str:
 
         # 5.1 回归核对：同项目上一轮的问题清单 -> 本轮逐条判定
         ensure_identity(t)
-        baseline = prepare_baseline(t)
+        # 先算代码包指纹并落盘：以后别人复审这份代码时靠它认出来（不靠标题）
+        try:
+            save_fp(mid, fingerprint_src(src))
+        except Exception as e:
+            log(f"[{mid}] 计算代码包指纹失败（不影响审核）: {e}", "WARN")
+        baseline = prepare_baseline(t, src=src)
         if baseline:
             t["baseline_mid"] = baseline["mid"]
             t["baseline_round"] = baseline["prev_round"]
             t["baseline_issue_count"] = baseline["total"]
             t["review_round"] = baseline["round"]
+            t["baseline_match"] = baseline.get("match") or {}
+            log(f"[{mid}] 复审匹配成功: {t['baseline_match']}")
         else:
             t.setdefault("review_round", round_of(t.get("subject", "")) or 1)
             # 标题里写了轮次（第2轮/第二版/v2）却没匹配到上一轮 ->
@@ -3987,6 +4405,7 @@ def run_all():
         PIDFILE.write_text(json.dumps({"bot": os.getpid()}), encoding="utf-8")
     except Exception as e:
         log(f"写 pid 文件失败（不影响运行）: {e}", "WARN")
+    prune_orphan_fps()
     th = threading.Thread(target=watch_supervisor, daemon=True, name="watch")
     th.start()
     log(f"机器人已启动：watch 通道 + worker 队列 (pid={os.getpid()})")
@@ -4452,6 +4871,61 @@ def _model_list(quiet: bool = False) -> int:
     return 0
 
 
+def cmd_score(args) -> int:
+    """按统一口径重算历史报告的分数
+
+    以前分数是模型每轮自己写的（上轮 58、本轮 62），修了一堆严重问题分数反而升，
+    开发者根本没法信。这个命令把有报告的任务按现在的口径重算一遗，
+    回填到任务里，旧轮次也能跟新轮次直接对比。
+    """
+    ids = ([args.id] if getattr(args, "id", None)
+           else [t.get("message_id") for t in all_tasks()])
+    done = changed = skipped = 0
+    for mid in ids:
+        t = load_task(mid) if mid else None
+        if not t:
+            if getattr(args, "id", None):
+                print(f"{mid}: 没有这个任务")
+            continue
+        md = baseline_report_path(t)
+        if md is None:
+            continue
+        try:
+            res = score_of_report(md.read_text(encoding="utf-8", errors="replace"))
+        except Exception as e:
+            print(f"{mid}: 报告读失败 {e}")
+            continue
+        if not res["total"]:
+            # 一行问题都没解析出来，说明报告格式不对，不能当「没问题 = 100 分」
+            skipped += 1
+            print(f"{mid}: 报告里没解析出问题行，跳过（不写满分）")
+            continue
+        old = t.get("score")
+        t["score"] = res["score"]
+        t["score_detail"] = {"version": res["version"], "counts": res["counts"],
+                            "penalty": res["penalty"], "verdict": res["verdict"]}
+        prev = t.get("baseline_mid")
+        pt = load_task(prev) if prev else None
+        if pt:
+            pmd = baseline_report_path(pt)
+            if pmd is not None:
+                pres = score_of_report(pmd.read_text(encoding="utf-8", errors="replace"))
+                if pres["total"]:
+                    t["score_prev"] = pres["score"]
+                    t["score_prev_counts"] = pres["counts"]
+        save_task(t)
+        done += 1
+        if old != res["score"]:
+            changed += 1
+        print(f"{mid}: {old} -> {res['score']} 分  "
+              f"严重{res['counts']['严重']} 高危{res['counts']['高危']} "
+              f"中危{res['counts']['中危']} 低危{res['counts']['低危']}  "
+              f"{res['verdict']}")
+    print(f"已按口径 v{scoring_version()} 重算 {done} 份报告"
+          f"（{changed} 份与之前不同，{skipped} 份因解析不出问题行而跳过）")
+    return 0
+
+
 def cmd_cookie(args) -> int:
     """配置/测试「超大附件」直链所需的邮箱网页登录态 Cookie
 
@@ -4658,6 +5132,9 @@ def main():
     p = sub.add_parser("resend", help="重新生成摘要并补发报告（不重新审核）")
     p.add_argument("--id", required=True, help="任务 id")
     p.add_argument("--no-summary", action="store_true", help="不重新生成摘要，直接重发原报告")
+    sub.add_parser("prune", help="清理没有对应任务的代码包指纹（state/fp 里的孤儿文件）")
+    p = sub.add_parser("score", help="按统一口径重算/回填历史报告的分数（让多轮可比）")
+    p.add_argument("--id", default=None, help="只算这个任务（默认算所有有报告的任务）")
     p = sub.add_parser("cookie", help="配置「超大附件」直链所需的邮箱网页 Cookie（MAIL5K）")
     p.add_argument("--set", default=None,
                    help="设置 Cookie 串（只给值会自动补 MAIL5K=）；传 - 清除")
@@ -4745,6 +5222,10 @@ def main():
             print(f.read_text(encoding="utf-8", errors="replace")[-8000:] if f.exists() else "无日志")
     elif cmd == "model":
         sys.exit(cmd_model(a))
+    elif cmd == "prune":
+        print(f"已清理孤儿代码包指纹 {prune_orphan_fps()} 个")
+    elif cmd == "score":
+        sys.exit(cmd_score(a))
     elif cmd == "cookie":
         sys.exit(cmd_cookie(a))
     elif cmd == "review":

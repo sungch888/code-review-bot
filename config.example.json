@@ -92,6 +92,7 @@
   "ack_timeout_sec": 300,
   "regression_review": true,
   "regression_max_issues": 80,
+  "baseline_similarity": 0.5,
   "download_cookie": "",
   "download_cookie_file": "",
   "llm_max_concurrency": 2,

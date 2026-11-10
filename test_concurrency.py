@@ -154,7 +154,7 @@ def main():
 
         def job(i, x):
             seen.append(x)
-            time.sleep(0.12)
+            time.sleep(0.30)      # 太短的话线程启动开销会盖过并发收益
             return x * 2
 
         t0 = time.time()
@@ -169,7 +169,7 @@ def main():
         # 相对判据（绝对阈值会因机器负载而误报）
         check("4 路并发明显快于串行", dt_par < dt_seq * 0.8,
               f"并发 {dt_par:.2f}s vs 串行 {dt_seq:.2f}s")
-        check("workers=1 时确实是串行", dt_seq >= 0.45, f"{dt_seq:.2f}s")
+        check("workers=1 时确实是串行", dt_seq >= 1.0, f"{dt_seq:.2f}s")
         check("空列表直接返回", B.run_parallel([], job, workers=4) == [])
 
         def boom(i, x):

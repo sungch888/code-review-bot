@@ -99,6 +99,51 @@ def main():
         check("状态写入都走 set_state", src.count("set_state(") >= 12,
               str(src.count("set_state(")))
 
+        # ================= 评分口径（多轮可比）=================
+        def rows(*lv):
+            out = []
+            for sev, n in lv:
+                out.extend({"level": sev, "desc": f"d{i}", "loc": "a.py:1"}
+                           for i in range(n))
+            return out
+
+        r_few = B.compute_score(rows(("严重", 1), ("高危", 2)))
+        r_many = B.compute_score(rows(("严重", 5), ("高危", 10)))
+        check("问题越严重分数越低", r_many["score"] < r_few["score"],
+              f'{r_many["score"]} vs {r_few["score"]}')
+
+        # 关键：条数小幅波动不该让分数乱跳（批次粗细不同会带来这种噪音）
+        a = B.compute_score(rows(("严重", 8), ("高危", 30), ("中危", 178), ("低危", 140)))
+        b = B.compute_score(rows(("严重", 8), ("高危", 30), ("中危", 185), ("低危", 143)))
+        check("条数 +7 条不该明显改变分数（log 抑制口径噪音）",
+              abs(a["score"] - b["score"]) <= 3, f'{a["score"]} vs {b["score"]}')
+
+        # 同一严重度分布 -> 同分（口径稳定）
+        c = B.compute_score(rows(("严重", 2), ("高危", 3)))
+        d = B.compute_score(rows(("高危", 3), ("严重", 2)))
+        check("顺序不影响分数", c["score"] == d["score"], f'{c["score"]} vs {d["score"]}')
+        check("级别写法归一（「高」= 高危）",
+              B.compute_score(rows(("高", 3)))["score"]
+              == B.compute_score(rows(("高危", 3)))["score"])
+        check("有严重问题 -> 不建议放行", r_many["verdict"] == "不建议放行",
+              r_many["verdict"])
+        check("无问题是满分", B.compute_score([])["score"] == 100)
+        check("分数有下限", B.compute_score(rows(("严重", 500)))["score"] >= 0)
+
+        # 报告里的模型自评分必须被系统分数替换
+        fake = ("## 总体评价\n本项目评分：81 分。\n\n## 问题清单\n")
+        new_text = B.rewrite_score_in_report(fake, r_few)
+        check("模型自评的分数被替换成口径分数", "81" not in new_text, new_text[:120])
+        check("替换后写明口径版本", "统一口径 v" in new_text, new_text[:160])
+
+        # 从历史报告重算（多轮对比的基础）
+        hist = ("## 问题清单\n| 编号 | 级别 | 文件:行号 | 问题描述 | 成因 | 后果 | "
+                "修改建议 | 证据 |\n| --- | --- | --- | --- | --- | --- | --- | --- |\n"
+                "| 1 | 严重 | a.py:1 | x | y | z | w | e |\n"
+                "| 2 | 高危 | b.py:2 | x | y | z | w | e |\n")
+        check("历史报告可以按同口径重算", B.score_of_report(hist)["counts"]["严重"] == 1,
+              str(B.score_of_report(hist)["counts"]))
+
         # ================= W2 报告规范单一来源 =================
         cols = B.spec_table_columns("issues_table")
         check("列定义来自模板", cols == ["编号", "级别", "文件:行号", "问题描述",

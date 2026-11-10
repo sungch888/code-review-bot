@@ -264,7 +264,7 @@ class Env:
         for name, val in (("WORK", self.tmp / "work"), ("TASKS", self.tmp / "tasks"),
                           ("LOCKS", self.tmp / "lock"), ("LOGS", self.tmp / "logs"),
                           ("REPORTS", self.tmp / "reports"),
-                          ("ACKS", self.tmp / "ack")):
+                          ("ACKS", self.tmp / "ack"), ("FP_DIR", self.tmp / "fp")):
             if hasattr(B, name):
                 self.saved[name] = getattr(B, name)
                 setattr(B, name, val)
@@ -671,6 +671,80 @@ def main():
     finally:
         env.close()
 
+    # ================= S19 多轮评分同口径（修好了分数必须体现）=================
+    env = Env()
+    try:
+        code = {f"app/m{i}.py": f"def f{i}():\n    return {i}\n" for i in range(10)}
+        # 第一轮：8 条严重 -> 分数应该很低
+        env.add_task("msg_s19a", "代码审核 - 评分对比", code)
+        env.run("msg_s19a")
+        ta = B.load_task("msg_s19a")
+        check("S19 第一轮算了分", ta.get("score") is not None, str(ta.get("score")))
+        check("S19 第一轮分数带口径版本",
+              (ta.get("score_detail") or {}).get("version") == B.scoring_version(),
+              str(ta.get("score_detail")))
+
+        # 第二轮：同一份代码，严重问题全修好（只剩中低危）
+        env.provider.tracking = [("严重", "app/main.py:10", "旧问题", "已修复")]
+        fixed = dict(code)
+        fixed["app/m0.py"] = "def f0():\n    return 0  # fixed"
+        env.add_task("msg_s19b", "代码审核 - 评分对比（第2轮）", fixed)
+        env.run("msg_s19b")
+        tb = B.load_task("msg_s19b")
+        check("S19 第二轮记住了上轮分数", tb.get("score_prev") is not None,
+              str(tb.get("score_prev")))
+        check("S19 两轮用同一口径（版本一致）",
+              (tb.get("score_detail") or {}).get("version") == B.scoring_version())
+        body = env.body("msg_s19b")
+        check("S19 回信给出同口径评分对比", "同口径评分" in body, body[-600:])
+        md = (Path(tb["report"]) / "代码审核报告.md").read_text(encoding="utf-8")
+        check("S19 报告里的分数是系统算的（带口径版本）", "统一口径 v" in md, md[:300])
+        recalc = B.compute_score(B.extract_issue_rows(md))
+        check("S19 报告分数与重算一致", recalc["score"] == tb.get("score"),
+              f'{recalc["score"]} vs {tb.get("score")}')
+        check("S19 上轮分数是 int（可直接比较）",
+              isinstance(tb.get("score_prev"), int), str(tb.get("score_prev")))
+    finally:
+        env.close()
+
+    # ================= S18 内容匹配：标题完全不同也认得出复审 =================
+    env = Env()
+    try:
+        code = {f"app/m{i}.py": f"def f{i}():\n    return {i}\n" for i in range(12)}
+        code.update({"README.md": "说明\n"})
+        env.add_task("msg_s18a", "代码审核 - 订单系统", code)
+        env.run("msg_s18a")
+        ta = B.load_task("msg_s18a")
+        check("S18 第一轮完成", ta["state"] == B.State.REPLIED, ta["state"])
+        check("S18 第一轮存了代码包指纹", bool(B.load_fp("msg_s18a")),
+              str(list((B.load_fp("msg_s18a") or {}).keys())))
+
+        # 改了两个文件、外层目录改名、**标题完全不一样**
+        code2 = dict(code)
+        code2["app/m0.py"] = "def f0():\n    return 100  # fixed"
+        code2["app/m1.py"] = "def f1():\n    return 101  # fixed"
+        env.provider.tracking = [
+            ("严重", "app/main.py:10", "SQL 拼接", "已修复"),
+            ("高危", "app/store.py:8", "缓存无过期", "未修复"),
+            ("中危", "app/api.py:22", "无入参校验", "部分修复"),
+        ]
+        env.add_task("msg_s18b", "代码审核 - 完全不同的标题 改好了", code2)
+        env.run("msg_s18b")
+        tb = B.load_task("msg_s18b")
+        check("S18 标题不同也认出了同一项目",
+              tb.get("baseline_mid") == "msg_s18a", str(tb.get("baseline_mid")))
+        check("S18 匹配依据是内容而非标题",
+              (tb.get("baseline_match") or {}).get("via") == "content",
+              str(tb.get("baseline_match")))
+        body = env.body("msg_s18b")
+        check("S18 回信写明了按内容匹配", "按代码包内容匹配" in body, body[-500:])
+        check("S18 回信给了相似度", "相似度" in body, body[-500:])
+        check("S18 报告里有上轮跟踪表",
+              "上轮问题跟踪" in (Path(tb["report"]) / "代码审核报告.md").read_text(
+                  encoding="utf-8"))
+    finally:
+        env.close()
+
     # ================= S17 复审没匹配上基线时要明说 =================
     env = Env()
     try:
@@ -681,8 +755,10 @@ def main():
               str(t.get("baseline_mismatch")))
         body = env.body("msg_s17")
         check("回信里明说未匹配到上一轮", "未匹配到上一轮" in body, body[-400:])
-        check("回信里给了怎么改标题的指引", "标题" in body and "轮次标记" in body,
-              body[-400:])
+        check("回信里说清了识别依据不是标题",
+              "不是邮件标题" in body, body[-400:])
+        check("回信里给了两条替代做法",
+              "【审核要求】" in body and "指定基线" in body, body[-400:])
     finally:
         env.close()
 
