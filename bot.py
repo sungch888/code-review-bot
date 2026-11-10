@@ -1407,13 +1407,40 @@ def content_baseline_threshold() -> float:
         return 0.5
 
 
+def ensure_fp(task: dict) -> dict:
+    """拿任务的代码包指纹；老任务现场补算一次
+
+    这次升级前审核的历史任务根本没存过指纹，不补的话它们永远匹不上，
+    第一次复审照样断链。只要 work/<id>/src 还在，就重算一份存起来。
+    """
+    mid = task.get("message_id", "")
+    if not mid:
+        return {}
+    fp = load_fp(mid) or task.get("fp") or {}
+    if fp.get("paths"):
+        return fp
+    src = Path(task.get("src_dir") or (WORK / mid / "src"))
+    if not src.is_dir():
+        return {}
+    try:
+        fp = fingerprint_src(src)
+    except Exception as e:
+        log(f"[{mid}] 补算代码包指纹失败（不影响审核）: {e}", "WARN")
+        return {}
+    if not fp.get("paths"):
+        return {}                      # 空包不存不匹，避免拿空集去「像」任何项目
+    save_fp(mid, fp)
+    log(f"[{mid}] 历史任务指纹已补算（{fp.get('n', 0)} 个文件）")
+    return fp
+
+
 def find_baseline_by_content(task: dict, src: Path, tasks=None):
     """按**代码包内容**找上一轮（同一份代码重新提交，标题怎么写都认得出）"""
     if task.get("regression_skip"):
         return None, None
     if not CONFIG.get("regression_review", True):
         return None, None
-    fp = fingerprint_src(src)
+    fp = fingerprint_src(src) if src else ensure_fp(task)
     if not fp.get("paths") or fp.get("n", 0) < 2:
         return None, None
     mid = task.get("message_id")
@@ -1429,7 +1456,7 @@ def find_baseline_by_content(task: dict, src: Path, tasks=None):
             continue
         if baseline_report_path(t) is None:
             continue
-        other = load_fp(t.get("message_id", "")) or t.get("fp") or {}
+        other = ensure_fp(t)
         if not other:
             continue
         score, detail = content_similarity(fp, other)

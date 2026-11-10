@@ -408,6 +408,29 @@ def main():
         check("prepare_baseline 走内容匹配", m.get("via") == "content", str(m))
         check("prepare_baseline 拿到上一轮清单", (bl or {}).get("total") == 3,
               str((bl or {}).get("total")))
+        # 升级前的历史任务没存过指纹：只要 work/<id>/src 还在，就该自动补算
+        _mk_src(B.WORK / "msg_legacy" / "src", proj)
+        mk_task("msg_legacy", "代码审核 - 老项目（升级前审核的）", 900,
+                state="REPLIED", with_report=True)
+        check("历史任务原本没有指纹文件",
+              not (B.FP_DIR / "msg_legacy.json").exists(),
+              str(sorted(f.stem for f in B.FP_DIR.glob("*.json"))))
+        lg = B.ensure_fp(B.load_task("msg_legacy"))
+        check("ensure_fp 从留下的 src 补算出指纹", bool(lg.get("paths")), str(list(lg)))
+        check("补算结果会存下来（下次不再重算）",
+              (B.FP_DIR / "msg_legacy.json").exists(),
+              str(sorted(f.stem for f in B.FP_DIR.glob("*.json"))))
+        got3 = B.find_baseline_by_content(cur_fp, src_b, tasks=[B.load_task("msg_legacy")])
+        check("补算后老任务也能被内容匹配认出",
+              bool(got3[0]) and got3[0]["message_id"] == "msg_legacy",
+              str(got3[0] and got3[0]["message_id"]))
+        _mk_src(B.WORK / "msg_nomod" / "src", {})
+        mk_task("msg_nomod", "代码审核 - 源码已被清掉", 901,
+                state="REPLIED", with_report=True)
+        check("源码目录空/被清就不匹配（不拿空集合冒充相似度）",
+              B.ensure_fp(B.load_task("msg_nomod")) == {},
+              str(B.ensure_fp(B.load_task("msg_nomod"))))
+
         # 指纹不能无限堆积：任务没了，指纹也要跟着清
         # （必须在临时 FP_DIR 里验，别写到真实 state/fp）
         (B.FP_DIR / "msg_gone.json").write_text("{}", encoding="utf-8")
