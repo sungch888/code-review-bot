@@ -710,6 +710,31 @@ def page_task(mid: str, flash: str = "", err: bool = False) -> str:
         score_html = (f'<div class="k">评分</div><div><b>{esc(t["score"])}</b> / 100'
                       f'<span class="sub">（口径 v{esc(ver)}：{esc(dist)}）</span></div>'
                       + delta)
+        trk = t.get("tracking") or {}
+        rec = (trk.get("recovery") or {}).get("pct")
+        if rec is not None:
+            rcol = "#30d158" if rec >= 50 else ("#ff9f0a" if rec >= 25 else "#ff453a")
+            lv = []
+            for s in ("严重", "高危", "中危", "低危"):
+                c = (trk.get("by_level") or {}).get(s) or {}
+                j = c.get("fixed", 0) + c.get("partial", 0) + c.get("unfixed", 0)
+                if j:
+                    lv.append(f"{s} {c.get('fixed', 0)}/{j}")
+            score_html += (f'<div class="k">按上轮清单修复率</div>'
+                           f'<div style="color:{rcol}"><b>{esc(rec)}%</b>'
+                           f'<span class="sub">（严重度加权：{esc("、".join(lv))}）</span></div>')
+        au = t.get("audit") or {}
+        if au.get("files") and au.get("prev_files"):
+            warn = (" ⚠ 两轮审核深度不同，分数不可直接比"
+                    if au["files"] >= 1.5 * au["prev_files"] or
+                    au["rows"] >= 1.5 * au["prev_rows"] else "")
+            score_html += (f'<div class="k">审核覆盖面</div><div>本轮 {esc(au["files"])} 文件'
+                           f'/{esc(au["rows"])} 条 · 上轮 {esc(au["prev_files"])} 文件'
+                           f'/{esc(au["prev_rows"])} 条'
+                           f'<span class="sub">{esc(warn)}</span></div>')
+        if t.get("score_note"):
+            score_html += (f'<div class="k">口径说明</div><div style="color:#ff9f0a">'
+                           f'{esc(t["score_note"])}</div>')
 
     tr = t.get("tracking") or {}
     track_html = ""
@@ -1164,7 +1189,7 @@ class Handler(BaseHTTPRequestHandler):
                         {k: t.get(k) for k in
                          ("message_id", "subject", "state", "attempts", "created_at",
                           "replied_at", "last_error", "score", "score_prev",
-                          "review_round", "baseline_mid")}
+                          "score_note", "review_round", "baseline_mid")}
                         for t in tasks()
                     ],
                 }, ensure_ascii=False, indent=2), "application/json; charset=utf-8")

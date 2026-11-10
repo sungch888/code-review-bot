@@ -697,6 +697,10 @@ def main():
               (tb.get("score_detail") or {}).get("version") == B.scoring_version())
         body = env.body("msg_s19b")
         check("S19 回信给出同口径评分对比", "同口径评分" in body, body[-600:])
+        check("S19 回信给出按上轮清单的加权修复率", "修复率" in body, body[-600:])
+        check("S19 修复率已算进任务字段",
+              ((tb.get("tracking") or {}).get("recovery") or {}).get("pct") is not None,
+              str((tb.get("tracking") or {}).get("recovery")))
         md = (Path(tb["report"]) / "代码审核报告.md").read_text(encoding="utf-8")
         check("S19 报告里的分数是系统算的（带口径版本）", "统一口径 v" in md, md[:300])
         recalc = B.compute_score(B.extract_issue_rows(md))

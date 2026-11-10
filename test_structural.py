@@ -69,6 +69,21 @@ def main():
         check("非法转移会记 WARN", any("非法状态转移" in x for x in LOGS),
               str([x for x in LOGS if "非法" in x][:1]))
 
+        # 本地重跑一个失败任务（bot.py review）不该被状态机拦住，
+        # 但也不能让别的路径把失败任务拖回队列
+        t_f = {"message_id": "msg_wf", "state": B.State.FAILED}
+        r = B.set_state(t_f, B.State.REVIEWED, "review_existing/复审重开")
+        check("FAILED 可被显式复审重开成 REVIEWED",
+              r == B.State.REVIEWED and t_f["state"] == B.State.REVIEWED, str(r))
+        t_f2 = {"message_id": "msg_wf2", "state": B.State.FAILED}
+        r = B.set_state(t_f2, B.State.REVIEWED, "process_task")
+        check("非复审路径不能把 FAILED 改成 REVIEWED",
+              r == B.State.FAILED and t_f2["state"] == B.State.FAILED, str(r))
+        t_r = {"message_id": "msg_wr", "state": B.State.REPLIED}
+        r = B.set_state(t_r, B.State.REVIEWED, "process_task")
+        check("非复审路径不能把 REPLIED 改成 REVIEWED",
+              r == B.State.REPLIED and t_r["state"] == B.State.REPLIED, str(r))
+
         t3 = {"message_id": "msg_w3", "state": B.State.SEEN}
         r = B.set_state(t3, "不存在的状态", "test")
         check("非法状态值被拒绝", r == B.State.SEEN and t3["state"] == B.State.SEEN)
@@ -135,6 +150,92 @@ def main():
         new_text = B.rewrite_score_in_report(fake, r_few)
         check("模型自评的分数被替换成口径分数", "81" not in new_text, new_text[:120])
         check("替换后写明口径版本", "统一口径 v" in new_text, new_text[:160])
+        # ---------- 跨轮对比的可信度：修复率 / 审核覆盖面 / 同包说明 ----------
+        fp_keep = B.FP_DIR
+        B.FP_DIR = TMP / "fp_struct"
+        B.FP_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            tr_txt = """## 上轮问题跟踪
+| 编号 | 级别 | 上轮问题 | 本轮判定 | 证据 | 说明 |
+|---|---|---|---|---|---|
+| 1 | 严重 | 数据丢失 | 已修复 | a.py:1 | ok |
+| 2 | 严重 | 越权访问 | 未修复 | a.py:2 | no |
+| 3 | 高危 | 空指针 | 部分修复 | a.py:3 | half |
+| 4 | 高危 | 竞态 | 部分修复 | a.py:4 | half |
+| 5 | 低危 | 命名 | 已修复 | a.py:5 | ok |
+| 6 | 中危 | 日志缺失 | 无法确认 | - | 文件没了 |
+"""
+            tr = B.parse_tracking(tr_txt)
+            check("跟踪表按上轮级别分桶",
+                  tr["by_level"]["严重"]["fixed"] == 1
+                  and tr["by_level"]["高危"]["partial"] == 2, str(tr["by_level"]))
+            # 加权：分母 10*2+4*2+1*1=29，分子 10*1+4*1+1*1=15 -> 52%
+            check("加权修复率算得对（无法确认不进分母）",
+                  tr["recovery"]["pct"] == 52, str(tr["recovery"]))
+            rl = B.recovery_line(tr)
+            check("修复率写明级别明细", "52%" in rl and "严重 1+0部分/2" in rl, rl)
+
+            cur_md = ("## 问题清单\n"
+                      "| 编号 | 级别 | 文件 | 位置 | 问题描述 |\n"
+                      "|---|---|---|---|---|\n"
+                      "| 1 | 高危 | doc/a.py | 12 | x |\n"
+                      "| 2 | 中危 | doc/b.py | 3 | y |\n"
+                      "| 3 | 低危 | doc/c.py | 4 | z |\n")
+            check("覆盖面按文件数与条数统计",
+                  B.audit_footprint(cur_md) == {"files": 3, "rows": 3},
+                  str(B.audit_footprint(cur_md)))
+
+            # 老报告留着模型自评分（62），必须换成口径分并解释来历
+            mid2 = "msg_scorelegacy"
+            t_legacy = {"message_id": mid2, "state": "REVIEWED",
+                        "created_at_ts": 100, "score": 21}
+            d_legacy = B.WORK / mid2 / "report"
+            d_legacy.mkdir(parents=True, exist_ok=True)
+            f_legacy = d_legacy / "代码审核报告.md"
+            f_legacy.write_text("## 总体评价\n**整体质量评分：62 / 100**\n" + cur_md,
+                                encoding="utf-8")
+            note1 = B.attach_score_context(t_legacy, f_legacy)
+            body1 = f_legacy.read_text(encoding="utf-8")
+            check("老报告的模型自评分被换成口径分",
+                  "62 / 100" not in body1 and "统一口径 v" in body1, body1[:150])
+            _res = B.compute_score(B.extract_issue_rows(body1))
+            check("口径分与报告清单自洽（同一份清单只对应一个数）",
+                  f'**{_res["score"]}**' in body1, body1[:200])
+            check("写明原先自评多少分", "原先自评为 62 分" in note1, note1)
+            note2 = B.attach_score_context(t_legacy, f_legacy)
+            body2 = f_legacy.read_text(encoding="utf-8")
+            check("重复回填不重复追加说明", body2.count("口径说明") == 1,
+                  str(body2.count("口径说明")))
+            check("再跑一遍不产生新说明", "原先自评" not in note2, note2[:120])
+
+            # 覆盖面差 1.5 倍以上必须写明「分数不能直接相减」
+            mid3, mid4 = "msg_cov_cur", "msg_cov_prev"
+            for mm, n in ((mid3, 4), (mid4, 2)):
+                dd = B.WORK / mm / "report"
+                dd.mkdir(parents=True, exist_ok=True)
+                head = "| 编号 | 级别 | 文件 | 位置 | 问题描述 |\n|---|---|---|---|---|\n"
+                (dd / "代码审核报告.md").write_text(
+                    "## 问题清单\n" + head
+                    + "".join(f"| {i} | 中危 | p{i}.py | 1 | x |\n" for i in range(n)),
+                    encoding="utf-8")
+            B.save_task({"message_id": mid4, "state": "REVIEWED", "created_at_ts": 10,
+                         "score": 90, "report": str(B.WORK / mid4 / "report")})
+            cur_t = {"message_id": mid3, "state": "REVIEWED", "created_at_ts": 20,
+                     "score": 60, "baseline_mid": mid4,
+                     "report": str(B.WORK / mid3 / "report")}
+            B.save_task(cur_t)
+            note3 = B.attach_score_context(
+                cur_t, B.WORK / mid3 / "report" / "代码审核报告.md")
+            check("覆盖面差一倍要写明分数不可直接相减", "不能直接相减" in note3, note3)
+            check("覆盖面数字存进任务",
+                  cur_t.get("audit") == {"files": 4, "rows": 4,
+                                         "prev_files": 2, "prev_rows": 2},
+                  str(cur_t.get("audit")))
+            check("回信里会给修复率而不是只给分数",
+                  "修复率" in B.recovery_line(tr) and "%" in B.recovery_line(tr))
+        finally:
+            B.FP_DIR = fp_keep
+
 
         # 从历史报告重算（多轮对比的基础）
         hist = ("## 问题清单\n| 编号 | 级别 | 文件:行号 | 问题描述 | 成因 | 后果 | "

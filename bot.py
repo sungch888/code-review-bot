@@ -1473,6 +1473,199 @@ def find_baseline_by_content(task: dict, src: Path, tasks=None):
     return best, {"score": round(best_score, 3), "via": "content", **best_detail}
 
 
+SAME_CODE_DEFAULT = 0.98
+SCORE_NOTE_MARK = "口径说明："
+
+
+def same_code_threshold() -> float:
+    try:
+        v = float(CONFIG.get("same_code_threshold", SAME_CODE_DEFAULT))
+    except (TypeError, ValueError):
+        v = SAME_CODE_DEFAULT
+    return min(max(v, 0.0), 1.0)
+
+
+def report_scores(mid: str, limit: int = 12) -> list:
+    """同一个任务的历史报告（含 report_v1..N 归档）按现口径各算一遍分
+
+    同一个任务的多个 report_* 就是「同一份代码被反复审核」的样本，
+    它们的分数跨度就是模型判定漂移的实测值，用来说明分数为什么不能看绝对值。
+    """
+    base = WORK / mid
+    out = []
+    try:
+        dirs = [p for p in base.iterdir()
+                if p.is_dir() and (p.name == "report" or p.name.startswith("report_v"))]
+    except OSError as e:
+        log(f"[{mid}] 扫报告目录失败: {e}", "WARN")
+        return out
+    for d in sorted(dirs, key=lambda p: p.name)[-limit:]:
+        f = d / "代码审核报告.md"
+        if not f.is_file():
+            continue
+        try:
+            res = score_of_report(f.read_text(encoding="utf-8", errors="replace"))
+        except Exception as e:
+            log(f"[{mid}] {d.name} 重算分数失败: {e}", "WARN")
+            continue
+        if res.get("total"):
+            out.append({"dir": d.name, "score": res["score"], "counts": res["counts"]})
+    return out
+
+
+def spread_line(samples) -> str:
+    """同一份代码多次审核的分数跨度（口径抖动实测）"""
+    ss = [int(s["score"]) for s in samples or [] if s.get("score") is not None]
+    if len(ss) < 2:
+        return ""
+    lo, hi = min(ss), max(ss)
+    return (f"同一份代码被审核 {len(ss)} 次，分数 {lo}~{hi}（跨度 {hi - lo} 分）"
+            "，来自模型对同一批问题的级别判定漂移，不是代码在变")
+
+
+def append_score_note(md_text: str, note: str) -> str:
+    """把说明贴在评分行下面——这类解释必须跟分数同屏，不然人只看到数字"""
+    if not note or SCORE_NOTE_MARK in str(md_text or ""):
+        return md_text
+    lines = str(md_text).split("\n")
+    for i, ln in enumerate(lines):
+        if "整体质量评分" in ln:
+            lines.insert(i + 1, f"\n> {SCORE_NOTE_MARK}{note}")
+            return "\n".join(lines)
+    return md_text
+
+
+def find_same_code(task: dict, src: Path = None, tasks=None):
+    """找代码包**几乎完全相同**的更早任务（同包重审，不是新一轮修复）
+
+    不分清就会把「同一份代码重跑」读成「代码变差了」，这事确实发生过。
+    """
+    mid = task.get("message_id")
+    fp = fingerprint_src(src) if src else ensure_fp(task)
+    if not fp.get("paths") or fp.get("n", 0) < 2:
+        return None, None
+    cur_ts = task.get("created_at_ts") or 0
+    pool = tasks if tasks is not None else all_tasks()
+    best, best_score, best_detail = None, 0.0, {}
+    for t in pool:
+        if t.get("message_id") == mid or t.get("score") is None:
+            continue
+        if cur_ts and (t.get("created_at_ts") or 0) > cur_ts:
+            continue
+        other = ensure_fp(t)
+        if not other:
+            continue
+        sc, detail = content_similarity(fp, other)
+        if sc > best_score:
+            best, best_score, best_detail = t, sc, detail
+    if best is None or best_score < same_code_threshold():
+        return None, None
+    return best, {"score": round(best_score, 3), **(best_detail or {})}
+
+
+def audit_footprint(src) -> dict:
+    """这一轮到底看了多少代码：清单里涉及的文件数与条数（确定性解析）
+
+    两轮覆盖面差一倍时，「问题条数」根本不是同一个量级的东西，
+    分数也就不能直接相减——所以先把覆盖面量出来。
+    """
+    try:
+        txt = (src.read_text(encoding="utf-8", errors="replace")
+               if isinstance(src, Path) else str(src or ""))
+    except OSError:
+        return {"files": 0, "rows": 0}
+    files, rows = set(), 0
+    for r in extract_issue_rows(txt):
+        rows += 1
+        f = str(r.get("loc") or "").split(":")[0].strip().replace("\\", "/")
+        if f:
+            files.add(f)
+    return {"files": len(files), "rows": rows}
+
+
+def attach_score_context(task: dict, md_file: Path = None) -> str:
+    """把「分数变化到底是不是代码变化」写进任务、报告和警告
+
+    两个信号：
+      1. 更早某轮的代码包跟本轮几乎一模一样 → 两轮分差同包重审差
+      2. 本任务自己存过多版报告（report_v*）→ 同一份代码的分数跨度
+    返回说明文字（空串表示没什么可提醒的）。
+    """
+    mid = task.get("message_id")
+    src = WORK / mid / "src" if mid else None
+    notes = []
+    twin, tdetail = find_same_code(task, src)
+    if twin:
+        task["same_code_of"] = twin.get("message_id")
+        task["same_code_sim"] = (tdetail or {}).get("score")
+        task["same_code_score"] = twin.get("score")
+        line = (f"本轮代码包与 {twin.get('message_id')} 内容相同"
+                f"（相似度 {(tdetail or {}).get('score')}），"
+                f"分数 {twin.get('score')} → {task.get('score')}")
+        if task.get("score") is not None and twin.get("score") is not None:
+            drift = int(task["score"]) - int(twin["score"])
+            task["score_drift"] = drift
+            line += f"（{drift:+d}）"
+        notes.append(line + "：这是同一份代码的重审差，不是代码变差")
+    samples = report_scores(mid) if mid else []
+    if len(samples) > 1:
+        task["score_samples"] = samples
+    sp = spread_line(samples)
+    if sp:
+        notes.append(sp)
+    # 审核覆盖面：上轮只看了 44 个文件、本轮看了 73 个，问题条数就不是同一个量级，
+    # 这时候分数差量的是「看到了多少代码」，不是「改好了多少」
+    try:
+        base_t = load_task(task.get("baseline_mid") or "")
+        base_md = baseline_report_path(base_t) if base_t else None
+        cur = audit_footprint(md_file) if md_file else {"files": 0, "rows": 0}
+        pv = audit_footprint(base_md) if base_md else {"files": 0, "rows": 0}
+        if cur.get("files") and pv.get("files"):
+            task["audit"] = {"files": cur["files"], "rows": cur["rows"],
+                             "prev_files": pv["files"], "prev_rows": pv["rows"]}
+            ratio = cur["files"] / pv["files"]
+            if ratio >= 1.5 or cur["rows"] >= 1.5 * pv["rows"]:
+                notes.append(
+                    f"本轮审核覆盖 {cur['files']} 个文件 / {cur['rows']} 条，上轮 "
+                    f"{pv['files']} 个文件 / {pv['rows']} 条（覆盖面差 {ratio:.1f} 倍），"
+                    "两轮问题量不在同一量级，分数不能直接相减；跨轮改善请看"
+                    "「按上轮清单（严重度加权）修复率」与上轮问题跟踪表")
+    except Exception as e:
+        log(f"[{task.get('message_id')}] 审核覆盖面统计失败: {e}", "WARN")
+    # 老报告里还留着模型自评分（比如 62），跟同口径数字并存会让人以为算错了
+    p = Path(md_file) if md_file is not None else None
+    body = ""
+    if p is not None:
+        try:
+            body = p.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            log(f"[{mid}] 报告读失败: {e}", "WARN")
+    if body and "统一口径" not in body and task.get("score") is not None:
+        om = re.search(r"整体质量评分\D{0,4}(\d{1,3})", body)
+        if om:
+            notes.append(f"报告原先自评为 {om.group(1)} 分（模型自己写的数，两轮之间不可比），"
+                         f"现按统一口径 v{scoring_version()} 重算为 {task['score']} 分")
+            old_body = body
+            body = rewrite_score_in_report(body, compute_score(extract_issue_rows(body)))
+            if body != old_body:
+                try:
+                    p.write_text(body, encoding="utf-8")
+                except OSError as e:
+                    log(f"[{mid}] 评分行改写失败: {e}", "WARN")
+    if not notes:
+        return ""
+    note = "；".join(notes)
+    task["score_note"] = note
+    if p is not None and body:
+        try:
+            new_txt = append_score_note(body, note)
+            if new_txt != body:
+                p.write_text(new_txt, encoding="utf-8")
+        except OSError as e:
+            log(f"[{mid}] 评分说明写不进报告: {e}", "WARN")
+    return note
+
+
 def find_baseline(task: dict, tasks=None):
     """找同项目上一轮**已发出**的任务（同 project_key、时间更早、报告存在）
 
@@ -1809,7 +2002,7 @@ def _verdict_of(cell: str) -> str:
 def parse_tracking(md_text: str) -> dict:
     """确定性统计「上轮问题跟踪」表：回信里的数字由这里算，不问模型"""
     out = {"total": 0, "fixed": 0, "partial": 0, "unfixed": 0, "unknown": 0,
-           "unfixed_items": []}
+           "by_level": {}, "recovery": {}, "unfixed_items": []}
     lines = str(md_text or "").splitlines()
     for head, cells in _iter_table_rows(lines, 0, ("上轮问题",), ("判定",)):
         jv = _table_col(head, "本轮判定", "判定")
@@ -1822,9 +2015,24 @@ def parse_tracking(md_text: str) -> dict:
         key = {"已修复": "fixed", "部分修复": "partial",
                "未修复": "unfixed", "无法确认": "unknown"}[v]
         out[key] += 1
+        # 按上轮的级别分桶：修复率只能拿上轮的级别算（本轮重新判级别会漂）
+        lv = _sev_key(at(jl)) or "其他"
+        bucket = out["by_level"].setdefault(lv, {"fixed": 0, "partial": 0,
+                                                "unfixed": 0, "unknown": 0})
+        bucket[key] += 1
         if v in ("未修复", "部分修复"):
             out["unfixed_items"].append({"level": _one_line(at(jl), 8) or "-",
                                          "desc": _one_line(at(jd), 200)})
+    # 加权修复率：严度大的旧问题修没修，比「修了几条」更接近真实改善
+    w = SCORING.get("severity_weights") or {}
+    num = den = 0.0
+    for lv, c in out["by_level"].items():
+        wt = float(w.get(lv, 0) or 0) or 1.0      # 认不出的级别当 1 分算
+        judged = c["fixed"] + c["partial"] + c["unfixed"]
+        den += wt * judged
+        num += wt * (c["fixed"] + 0.5 * c["partial"])   # 部分修算一半
+    out["recovery"] = {"pct": round(100 * num / den) if den else None,
+                       "judged": int(den), "unknown": out["unknown"]}
     return out
 
 
@@ -1836,6 +2044,26 @@ def tracking_line(tr: dict, new_count: int = 0) -> str:
     if new_count:
         s += f"；本轮新增 {new_count} 项"
     return s
+
+
+def recovery_line(tr: dict) -> str:
+    """按上轮清单的严重度算修复率（跳轮对比里最稳的一个数）
+
+    分数靠本轮重新判定问题清单，本轮漏报/级别判不一样就会漂；
+    而这里只用上轮那份清单的级别 + 本轮的修没修判定，不受本轮条数影响。
+    """
+    rec = (tr or {}).get("recovery") or {}
+    pct = rec.get("pct")
+    if pct is None or not tr.get("total"):
+        return ""
+    bits = []
+    for sev in list(_SEV_ORDER) + ["其他"]:
+        c = (tr.get("by_level") or {}).get(sev) or {}
+        j = c.get("fixed", 0) + c.get("partial", 0) + c.get("unfixed", 0)
+        if j:
+            bits.append(f"{sev} {c.get('fixed', 0)}+{c.get('partial', 0)}部分/{j}")
+    tail = f"（无法确认 {rec['unknown']} 条不计入）" if rec.get("unknown") else ""
+    return (f"按上轮清单（严重度加权）修复率 {pct}%：" + "、".join(bits) + tail)
 
 
 def prepare_baseline(task: dict, tasks=None, src: Path = None):
@@ -3539,6 +3767,15 @@ def run_review(task, extra: str = "", baseline: dict = None) -> Path:
     except Exception as e:
         warnings.append(f"评分计算失败：{e}")
         log(f"[{mid}] 评分计算失败: {e}", "WARN")
+    # 先分清「代码变了」还是「同一份代码重审」：不写清楚就会被读成越修越差
+    try:
+        note = attach_score_context(task, md)
+        if note:
+            warnings.append(note)
+            log(f"[{mid}] {note}", "WARN")
+    except Exception as e:
+        warnings.append(f"同包重审检测失败：{e}")
+        log(f"[{mid}] 同包重审检测失败（不影响审核）: {e}", "WARN")
     if baseline:
         tr = parse_tracking(final_txt)
         task["tracking"] = tr
@@ -3670,7 +3907,7 @@ ALLOWED_TRANSITIONS = {
     State.DOWNLOADED: {State.REVIEWED, State.REPLIED, State.FAILED, State.IGNORED},
     State.REVIEWED: {State.AWAITING_APPROVAL, State.REPLIED, State.FAILED},
     State.AWAITING_APPROVAL: {State.REPLIED, State.REJECTED, State.FAILED},
-    State.FAILED: {State.SEEN, State.REPLIED},     # SEEN=重试，REPLIED=失败通知已发
+    State.FAILED: {State.SEEN, State.REPLIED, State.REVIEWED},   # SEEN=重试，REPLIED=失败通知已发，REVIEWED=显式复审
     # REPLIED 只能被**显式复审**重新打开（review_existing），其它路径一律拒绝
     State.REPLIED: {State.REVIEWED},
     State.REJECTED: set(),
@@ -3705,8 +3942,10 @@ def set_state(task: dict, new: str, where: str = "") -> str:
     if not can_transition(old, new):
         log(f"[{task.get('message_id')}] 非法状态转移 {old} -> {new}（{where}），已拒绝", "WARN")
         return old
-    # REPLIED -> REVIEWED 只允许显式复审打开，防止别的路径把已回信的任务拖回队列
-    if old == State.REPLIED and new == State.REVIEWED and not where.startswith("review_existing"):
+    # REPLIED / FAILED -> REVIEWED 只允许**显式复审**打开，防止别的路径把
+    # 已回信或已判失败的任务拖回队列（本地重跑一份报告不应该被状态机拦住）
+    if (old in (State.REPLIED, State.FAILED) and new == State.REVIEWED
+            and not where.startswith("review_existing")):
         log(f"[{task.get('message_id')}] 拒绝 {old} -> {new}（{where}）：只有显式复审可以重开",
             "WARN")
         return old
@@ -3965,6 +4204,11 @@ def build_body(task, report_dir: Path, files) -> str:
             track.append("两轮用**同一套口径**重算，所以这个变化可以直接比较；"
                          "问题条数会随代码量与审核批次波动，分数只看严重度分布。")
         track.append(tracking_line(tr, task.get("new_issues") or 0))
+        rec = recovery_line(tr)
+        if rec:
+            track.append(rec)
+        if task.get("score_note"):
+            track.append(f"注意：{task['score_note']}")
         pend = (tr.get("unfixed_items") or [])[:5]
         if pend:
             track.append("仍未修复 / 未修完的项（建议优先处理）：")
@@ -4944,10 +5188,24 @@ def cmd_score(args) -> int:
         done += 1
         if old != res["score"]:
             changed += 1
+        # 历史报告也补上：上轮清单修复率 + 同包重审说明（都是纯本地重算）
+        extra = ""
+        try:
+            body = md.read_text(encoding="utf-8", errors="replace")
+            tr = parse_tracking(body)
+            if tr.get("total"):
+                t["tracking"] = tr
+                extra = "  " + recovery_line(tr)
+            note = attach_score_context(t, md)
+            if note:
+                extra += f"\n    ⚠ {note}"
+            save_task(t)
+        except Exception as e:
+            print(f"{mid}: 补跟踪/同包说明失败 {e}")
         print(f"{mid}: {old} -> {res['score']} 分  "
               f"严重{res['counts']['严重']} 高危{res['counts']['高危']} "
               f"中危{res['counts']['中危']} 低危{res['counts']['低危']}  "
-              f"{res['verdict']}")
+              f"{res['verdict']}{extra}")
     print(f"已按口径 v{scoring_version()} 重算 {done} 份报告"
           f"（{changed} 份与之前不同，{skipped} 份因解析不出问题行而跳过）")
     return 0
