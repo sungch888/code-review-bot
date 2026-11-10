@@ -94,6 +94,7 @@
   "regression_max_issues": 80,
   "baseline_similarity": 0.5,
   "same_code_threshold": 0.98,
+  "grade_anchor": true,
   "download_cookie": "",
   "download_cookie_file": "",
   "llm_max_concurrency": 2,

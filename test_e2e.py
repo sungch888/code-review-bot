@@ -698,9 +698,11 @@ def main():
               (tb.get("score_detail") or {}).get("version") == B.scoring_version())
         body = env.body("msg_s19b")
         basis = (tb.get("score_detail") or {}).get("basis")
-        check("S19 分数按问题台账算", basis == "ledger", str(tb.get("score_detail")))
-        check("S19 回信给出台账评分对比",
-              ("台账评分" in body if basis == "ledger" else "同口径评分" in body), body[-600:])
+        check("S19 分数只由本轮清单算", basis == "round", str(tb.get("score_detail")))
+        check("S19 回信说明各轮同口径、各算各的", "同口径评分" in body, body[-600:])
+        note = tb.get("ledger_note") or ""
+        check("S19 说明点明本轮分数与历轮无关、跨轮看修复率",
+              "本轮分数只由本轮清单" in note and "修复率" in note, note)
         check("S19 回信给出按上轮清单的加权修复率", "修复率" in body, body[-600:])
         check("S19 修复率已算进任务字段",
               ((tb.get("tracking") or {}).get("recovery") or {}).get("pct") is not None,

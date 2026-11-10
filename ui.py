@@ -711,32 +711,30 @@ def page_task(mid: str, flash: str = "", err: bool = False) -> str:
                       f'<span class="sub">（口径 v{esc(ver)}：{esc(dist)}）</span></div>'
                       + delta)
         lg = t.get("ledger") or {}
+        det = (t.get("score_detail") or {})
+        if det.get("rows") is not None:
+            score_html += (f'<div class="k">本轮清单</div><div>{esc(det["rows"])} 条'
+                           f'<span class="sub">（分数只由本轮清单算，与历轮分数无关）'
+                           f'</span></div>')
         if lg.get("open") is not None:
-            det = (t.get("score_detail") or {})
-            lab = "台账在册未修复" if det.get("basis") == "ledger" else "本轮清单条数"
-            bits = [f"{lab} {lg['open']} 条"]
-            for k, name in (("fixed_out", "本轮销账"), ("new_in", "新入册"),
-                            ("late_found", "其中历史遗留"), ("regression", "改动新引入"),
+            bits = [f"在册未修复 {lg['open']} 条"]
+            for k, name in (("new_in", "本轮新登记"), ("late_found", "其中历史遗留"),
+                            ("regression", "改动新引入"), ("fixed_out", "本轮销账"),
                             ("relapse", "修过又回来")):
                 if lg.get(k):
                     bits.append(f"{name} {lg[k]}")
             if lg.get("stale"):
-                bits.append(f"连续两轮未重新报出 {lg['stale']} 条（按未修复保留）")
-            score_html += (f'<div class="k">问题台账</div><div>{esc("，".join(bits))}'
+                bits.append(f"连续两轮未重新报出 {lg['stale']} 条（疑似漏报，待复核）")
+            score_html += (f'<div class="k">问题台账（不计分，用于跟踪）</div>'
+                           f'<div>{esc("，".join(bits))}'
                            f'<span class="sub">（已核 {lg.get("rounds", 0)} 轮）</span></div>')
-        br = t.get("score_bridge") or {}
-        steps = [x for x in (br.get("steps") or [])
-                 if abs(x.get("delta") or 0) >= 0.05 and x.get("key") != "seed"]
-        if steps:
-            parts = []
-            for x in steps:
-                d = x.get("delta") or 0
-                col = "#30d158" if d > 0 else "#ff453a"
-                parts.append(f'{esc(x["name"])} {x["count"]} 条 '
-                             f'<span style="color:{col}">{d:+g} 分</span>')
-            score_html += (f'<div class="k">分数为什么变</div>'
-                           f'<div>{br.get("base"):g} → {br.get("final"):g}：'
-                           f'{"；".join(parts)}</div>')
+        if lg.get("anchored") or lg.get("drift"):
+            parts = [f'判级锚定 {lg.get("anchored", 0)} 条'
+                     '<span class="sub">（同问题同字节，沿用已定判级）</span>']
+            if lg.get("drift"):
+                parts.append(f'<span style="color:#ff9f0a">判级漂移 {lg["drift"]} 条'
+                             '（同一份代码模型想改判级，待复核）</span>')
+            score_html += (f'<div class="k">判级一致性</div><div>{"；".join(parts)}</div>')
         trk = t.get("tracking") or {}
         rec = (trk.get("recovery") or {}).get("pct")
         if rec is not None:
@@ -752,7 +750,7 @@ def page_task(mid: str, flash: str = "", err: bool = False) -> str:
                            f'<span class="sub">（严重度加权：{esc("、".join(lv))}）</span></div>')
         au = t.get("audit") or {}
         if au.get("files") and au.get("prev_files"):
-            warn = (" ⚠ 两轮审核深度不同，新增问题已按字节归因"
+            warn = (" ⚠ 两轮审核深度不同，本轮分数按本轮清单算"
                     if au["files"] >= 1.5 * au["prev_files"] or
                     au["rows"] >= 1.5 * au["prev_rows"] else "")
             score_html += (f'<div class="k">审核覆盖面</div><div>本轮 {esc(au["files"])} 文件'
@@ -1216,7 +1214,7 @@ class Handler(BaseHTTPRequestHandler):
                         {k: t.get(k) for k in
                          ("message_id", "subject", "state", "attempts", "created_at",
                           "replied_at", "last_error", "score", "score_prev",
-                          "score_note", "ledger", "score_bridge", "tracking",
+                          "score_note", "score_detail", "ledger", "ledger_note", "tracking",
                           "review_round", "baseline_mid")}
                         for t in tasks()
                     ],
