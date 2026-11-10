@@ -264,7 +264,8 @@ class Env:
         for name, val in (("WORK", self.tmp / "work"), ("TASKS", self.tmp / "tasks"),
                           ("LOCKS", self.tmp / "lock"), ("LOGS", self.tmp / "logs"),
                           ("REPORTS", self.tmp / "reports"),
-                          ("ACKS", self.tmp / "ack"), ("FP_DIR", self.tmp / "fp")):
+                          ("ACKS", self.tmp / "ack"), ("FP_DIR", self.tmp / "fp"),
+                          ("LEDGER_DIR", self.tmp / "ledger")):
             if hasattr(B, name):
                 self.saved[name] = getattr(B, name)
                 setattr(B, name, val)
@@ -696,7 +697,10 @@ def main():
         check("S19 两轮用同一口径（版本一致）",
               (tb.get("score_detail") or {}).get("version") == B.scoring_version())
         body = env.body("msg_s19b")
-        check("S19 回信给出同口径评分对比", "同口径评分" in body, body[-600:])
+        basis = (tb.get("score_detail") or {}).get("basis")
+        check("S19 分数按问题台账算", basis == "ledger", str(tb.get("score_detail")))
+        check("S19 回信给出台账评分对比",
+              ("台账评分" in body if basis == "ledger" else "同口径评分" in body), body[-600:])
         check("S19 回信给出按上轮清单的加权修复率", "修复率" in body, body[-600:])
         check("S19 修复率已算进任务字段",
               ((tb.get("tracking") or {}).get("recovery") or {}).get("pct") is not None,

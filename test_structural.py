@@ -16,6 +16,7 @@ BASE = Path(__file__).resolve().parent
 sys.path.insert(0, str(BASE))
 
 import bot as B  # noqa: E402
+LF2 = chr(10)          # 测试里拼接换行，避开写文件时的转义点
 
 PASS = 0
 FAIL = 0
@@ -226,15 +227,174 @@ def main():
             B.save_task(cur_t)
             note3 = B.attach_score_context(
                 cur_t, B.WORK / mid3 / "report" / "代码审核报告.md")
-            check("覆盖面差一倍要写明分数不可直接相减", "不能直接相减" in note3, note3)
+            check("覆盖面差一倍时写明报多报少不影响评分（按台账算）",
+                  "不影响评分" in note3 and "台账" in note3, note3)
             check("覆盖面数字存进任务",
                   cur_t.get("audit") == {"files": 4, "rows": 4,
                                          "prev_files": 2, "prev_rows": 2},
                   str(cur_t.get("audit")))
             check("回信里会给修复率而不是只给分数",
                   "修复率" in B.recovery_line(tr) and "%" in B.recovery_line(tr))
+            check("无法归因的新条目不叫「本轮引入」",
+                  "unknown_origin" in B.ledger_apply(B.load_ledger("proj-uk"), [], {}, "m1"))
         finally:
             B.FP_DIR = fp_keep
+
+        # ================= 问题台账：分数不再跟着「本轮报几条」跑 =================
+        led_keep = B.LEDGER_DIR
+        B.LEDGER_DIR = TMP / "ledger_struct"
+        B.LEDGER_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            def rows2(*triples):
+                return [{"level": lv, "desc": d, "loc": f"{p}:10"}
+                        for lv, p, d in triples]
+
+            led = B.load_ledger("proj-ledger")
+            d1 = B.ledger_apply(led, rows2(("严重", "a.py", "整表删除无备份"),
+                                           ("高危", "b.py", "越权访问"),
+                                           ("低危", "c.py", "命名不规范")), {}, "m1")
+            s1 = B.ledger_score(led)
+            check("首轮入册 3 条", d1["new_in"] == 3 and s1["open"] == 3,
+                  f'{d1} open={s1["open"]}')
+
+            # 本轮只报出 2 条（漏了一条），且没有任何「已修复」判定
+            d2 = B.ledger_apply(led, rows2(("严重", "a.py", "整表删除无备份"),
+                                           ("高危", "b.py", "越权访问")), {}, "m2")
+            s2 = B.ledger_score(led)
+            check("本轮漏报不会让债务消失（fail-closed）",
+                  s2["open"] == 3 and s2["score"] == s1["score"] and d2["new_in"] == 0,
+                  f'{s2["open"]} open, {s2["score"]} 分')
+
+            # 真修好了（跟踪表判已修复）才销账，分数才涨
+            tr_ok = {"items": {"fixed": [{"level": "高危", "desc": "越权访问", "loc": "b.py"}],
+                               "partial": [], "unfixed": [], "unknown": []}}
+            d3 = B.ledger_apply(led, rows2(("严重", "a.py", "整表删除无备份")), tr_ok, "m3")
+            s3 = B.ledger_score(led)
+            check("只有判「已修复」才销账", d3["fixed_out"] == 1 and s3["open"] == 2, str(d3))
+            check("真修好后分数才上升", s3["score"] > s2["score"],
+                  f'{s2["score"]} -> {s3["score"]}')
+
+            # 同一条问题被轻判：级别取两轮中更严的
+            led2 = B.load_ledger("proj-sev")
+            B.ledger_apply(led2, rows2(("严重", "x.py", "整表删除")), {}, "m1")
+            B.ledger_apply(led2, rows2(("中危", "x.py", "整表删除")), {}, "m2")
+            it = list(led2["items"].values())[0]
+            check("级别取两轮中更严的（旧债不能被轻判洗掉）", it["level"] == "严重",
+                  str(it["level"]))
+
+            # 同一份代码重审：分数一格不变
+            led3 = B.load_ledger("proj-same")
+            two = rows2(("严重", "x.py", "问题一"), ("高危", "y.py", "问题二"))
+            B.ledger_apply(led3, two, {}, "m1")
+            a = B.ledger_score(led3)["score"]
+            B.ledger_apply(led3, two, {}, "m2")
+            b = B.ledger_score(led3)["score"]
+            check("同一份代码重审，分数不变", a == b, f"{a} vs {b}")
+
+            # 新报的问题：字节一致=上轮漏报的历史遗留；内容变了=本轮引入
+            pk, ck = TMP / "pkg_prev", TMP / "pkg_cur"
+            (pk / "outer").mkdir(parents=True, exist_ok=True)
+            (ck / "outer").mkdir(parents=True, exist_ok=True)
+            (pk / "outer" / "a.py").write_text("print(1)\n", encoding="utf-8")
+            (ck / "outer" / "a.py").write_text("print(1)\n", encoding="utf-8")
+            led4 = B.load_ledger("proj-origin")
+            B.ledger_apply(led4, rows2(("高危", "outer/a.py", "旧债一")), {}, "m1")
+            d5 = B.ledger_apply(led4, rows2(("高危", "outer/a.py", "旧债一"),
+                                            ("中危", "outer/a.py", "新看到的旧问题")),
+                                {}, "m2", src=ck, prev_src=pk)
+            check("与上轮字节一致的新报问题归为历史遗留",
+                  d5["late_found"] == 1 and d5["regression"] == 0, str(d5))
+            (ck / "outer" / "a.py").write_text("print(2)  # changed\n", encoding="utf-8")
+            d6 = B.ledger_apply(led4, rows2(("高危", "outer/a.py", "旧债一"),
+                                            ("中危", "outer/a.py", "本轮改出来的问题")),
+                                {}, "m3", src=ck, prev_src=pk)
+            check("改动后新出现的问题按新问题扣分", d6["regression"] >= 1, str(d6))
+
+            # 台账跟项目链走，不跟邮件标题走
+            keep_tasks = B.TASKS
+            B.TASKS = TMP / "tasks_ledger"
+            B.TASKS.mkdir(parents=True, exist_ok=True)
+            try:
+                B.save_task({"message_id": "m_base", "state": "REVIEWED",
+                             "subject": "代码审核 甲项目", "ledger_key": "链甲"})
+                check("台账继承上一轮的链，不用标题猜",
+                      B.ledger_key_of({"message_id": "m_next",
+                                       "subject": "代码审核 甲项目 修复版 v3",
+                                       "baseline_mid": "m_base"}) == "链甲")
+            finally:
+                B.TASKS = keep_tasks
+
+            # 报告里的分数行换成台账分，并说明这笔账怎么来的
+            mid5 = "msg_ledger_report"
+            d5dir = B.WORK / mid5 / "report"
+            d5dir.mkdir(parents=True, exist_ok=True)
+            f5 = d5dir / "代码审核报告.md"
+            body = ("**整体质量评分：70 / 100**\n\n## 问题清单\n"
+                    "| 编号 | 级别 | 文件 | 位置 | 问题描述 |\n|---|---|---|---|---|\n"
+                    "| 1 | 严重 | a.py | 10 | 整表删除 |\n")
+            f5.write_text(body, encoding="utf-8")
+            t5 = {"message_id": mid5, "subject": "代码审核 台账报告",
+                  "state": "REVIEWED", "created_at_ts": 5}
+            B.apply_ledger_and_score(t5, B.extract_issue_rows(body), {}, f5)
+            out5 = f5.read_text(encoding="utf-8")
+            check("报告分数行换成台账分",
+                  "70 / 100" not in out5 and "统一口径 v" in out5, out5[:200])
+            check("任务记下台账口径",
+                  (t5.get("score_detail") or {}).get("basis") == "ledger",
+                  str(t5.get("score_detail")))
+            check("说明点明在册未修复条数",
+                  "台账在册未修复" in (t5.get("ledger_note") or ""),
+                  t5.get("ledger_note") or "")
+
+            # 同一任务重跑：不能把这一轮记两次
+            mid6 = "msg_ledger_rerun"
+            d6dir = B.WORK / mid6 / "report"
+            d6dir.mkdir(parents=True, exist_ok=True)
+            f6 = d6dir / "代码审核报告.md"
+            f6.write_text(body, encoding="utf-8")
+            t6 = {"message_id": mid6, "subject": "代码审核 重放去重",
+                  "state": "REVIEWED", "created_at_ts": 6}
+            B.apply_ledger_and_score(t6, B.extract_issue_rows(body), {}, f6)
+            key6 = t6["ledger_key"]
+            rounds1 = len(B.load_ledger(key6)["rounds"])
+            B.apply_ledger_and_score(t6, B.extract_issue_rows(body), {}, f6)
+            led6 = B.load_ledger(B.ledger_key_of(t6))
+            r6 = [x for x in led6["rounds"] if x["mid"] == mid6]
+            check("同一任务重跑不会重复入账",
+                  len(r6) == 1 and len(led6["rounds"]) == rounds1,
+                  f'{len(r6)} 次 / 共 {len(led6["rounds"])} 轮')
+
+            # 拆账：分数变化每一步都要能对上号
+            led7 = B.load_ledger("proj-bridge")
+            B.ledger_apply(led7, rows2(("严重", "a.py", "甲问题"),
+                                       ("高危", "b.py", "乙问题")), {}, "m1")
+            tr7 = {"items": {"fixed": [{"level": "高危", "desc": "乙问题", "loc": "b.py"}],
+                             "partial": [], "unfixed": [], "unknown": []}}
+            d7 = B.ledger_apply(led7, rows2(("严重", "a.py", "甲问题")), tr7, "m2")
+            br = d7["bridge"]
+            check("拆账各步之和等于总分变化",
+                  abs(sum(x["delta"] for x in br["steps"]) - br["total"]) <= 0.2, str(br))
+            check("拆账能单独看见「销账是加分」",
+                  any(x["key"] == "fixed" and x["delta"] > 0 for x in br["steps"]),
+                  str(br["steps"]))
+            d8 = B.ledger_apply(led7, rows2(("严重", "a.py", "甲问题")), {}, "m3")
+            check("在册问题原样重报，分数不动",
+                  abs(d8["bridge"]["total"]) < 0.01, str(d8["bridge"]))
+            check("说明里会写分数为什么变",
+                  "分数" in B.ledger_note(B.ledger_score(led7), d7),
+                  B.ledger_note(B.ledger_score(led7), d7))
+            # 口径说明必须能刷新：重放台账后不能留着上一版那句过期话
+            md8 = ('整体质量评分：**40** / 100' + LF2 + LF2 + '> ' + B.SCORE_NOTE_MARK
+                   + '旧的话，说分数不可直接比' + LF2 + LF2 + '正文')
+            out8 = B.append_score_note(md8, '新的话')
+            check('过期说明被换掉', '旧的话' not in out8 and '新的话' in out8, out8)
+            check('同一时刻只留一条说明',
+                  out8.count(B.SCORE_NOTE_MARK) == 1 and
+                  B.append_score_note(out8, '新的话').count(B.SCORE_NOTE_MARK) == 1,
+                  str(out8.count(B.SCORE_NOTE_MARK)))
+            check('没有评分行就不硬塞', B.append_score_note('正文', '话') == '正文')
+        finally:
+            B.LEDGER_DIR = led_keep
 
 
         # 从历史报告重算（多轮对比的基础）

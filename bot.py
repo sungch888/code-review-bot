@@ -1524,15 +1524,27 @@ def spread_line(samples) -> str:
 
 
 def append_score_note(md_text: str, note: str) -> str:
-    """把说明贴在评分行下面——这类解释必须跟分数同屏，不然人只看到数字"""
-    if not note or SCORE_NOTE_MARK in str(md_text or ""):
+    """把说明贴在评分行下面，并且允许刷新
+
+    见标记就跳过不行：口径改了、台账重放了，报告里还留着上一版那句
+    「分数不可直接比」，比不写更坑。同一条说明只许有一行，过期就换。
+    """
+    if not note or not str(md_text or "").strip():
         return md_text
-    lines = str(md_text).split("\n")
-    for i, ln in enumerate(lines):
+    text = str(md_text)
+    line = "> " + SCORE_NOTE_MARK + note
+    ls = text.split("\n")
+    for i, ln in enumerate(ls):
+        if SCORE_NOTE_MARK in ln:
+            if ln.strip() == line.strip():
+                return text              # 已是最新，不重复改写
+            ls[i] = line
+            return "\n".join(ls)
+    for i, ln in enumerate(ls):
         if "整体质量评分" in ln:
-            lines.insert(i + 1, f"\n> {SCORE_NOTE_MARK}{note}")
-            return "\n".join(lines)
-    return md_text
+            ls.insert(i + 1, "\n" + line)
+            return "\n".join(ls)
+    return text
 
 
 def find_same_code(task: dict, src: Path = None, tasks=None):
@@ -1594,25 +1606,34 @@ def attach_score_context(task: dict, md_file: Path = None) -> str:
     mid = task.get("message_id")
     src = WORK / mid / "src" if mid else None
     notes = []
+    # 台账口径下，分数只会因「销账 / 新入册」动，不会因重审漂移，
+    # 旧的重审漂移说明（拿模型自评分算的跨度）不能再掺进来
+    ledger_basis = (task.get("score_detail") or {}).get("basis") == "ledger"
+    if task.get("ledger_note"):
+        notes.append(task["ledger_note"])
     twin, tdetail = find_same_code(task, src)
     if twin:
         task["same_code_of"] = twin.get("message_id")
         task["same_code_sim"] = (tdetail or {}).get("score")
         task["same_code_score"] = twin.get("score")
         line = (f"本轮代码包与 {twin.get('message_id')} 内容相同"
-                f"（相似度 {(tdetail or {}).get('score')}），"
-                f"分数 {twin.get('score')} → {task.get('score')}")
+                f"（相似度 {(tdetail or {}).get('score')}）")
         if task.get("score") is not None and twin.get("score") is not None:
             drift = int(task["score"]) - int(twin["score"])
             task["score_drift"] = drift
-            line += f"（{drift:+d}）"
-        notes.append(line + "：这是同一份代码的重审差，不是代码变差")
+            line += f"，分数 {twin.get('score')} → {task.get('score')}（{drift:+d}）"
+        if ledger_basis:
+            line += "：同一份代码在台账里就是同一笔账，分差只能来自新入册或销账"
+        else:
+            line += "：这是同一份代码的重审差，不是代码变差"
+        notes.append(line)
     samples = report_scores(mid) if mid else []
     if len(samples) > 1:
         task["score_samples"] = samples
-    sp = spread_line(samples)
-    if sp:
-        notes.append(sp)
+    if not ledger_basis:
+        sp = spread_line(samples)
+        if sp:
+            notes.append(sp)
     # 审核覆盖面：上轮只看了 44 个文件、本轮看了 73 个，问题条数就不是同一个量级，
     # 这时候分数差量的是「看到了多少代码」，不是「改好了多少」
     try:
@@ -1626,10 +1647,9 @@ def attach_score_context(task: dict, md_file: Path = None) -> str:
             ratio = cur["files"] / pv["files"]
             if ratio >= 1.5 or cur["rows"] >= 1.5 * pv["rows"]:
                 notes.append(
-                    f"本轮审核覆盖 {cur['files']} 个文件 / {cur['rows']} 条，上轮 "
-                    f"{pv['files']} 个文件 / {pv['rows']} 条（覆盖面差 {ratio:.1f} 倍），"
-                    "两轮问题量不在同一量级，分数不能直接相减；跨轮改善请看"
-                    "「按上轮清单（严重度加权）修复率」与上轮问题跟踪表")
+                    f"本轮报出 {cur['rows']} 条 / 覆盖 {cur['files']} 个文件，上轮 "
+                    f"{pv['rows']} 条 / {pv['files']} 个（覆盖面差 {ratio:.1f} 倍）"
+                    "——报多报少不影响评分，分数只按台账算")
     except Exception as e:
         log(f"[{task.get('message_id')}] 审核覆盖面统计失败: {e}", "WARN")
     # 老报告里还留着模型自评分（比如 62），跟同口径数字并存会让人以为算错了
@@ -1664,6 +1684,543 @@ def attach_score_context(task: dict, md_file: Path = None) -> str:
         except OSError as e:
             log(f"[{mid}] 评分说明写不进报告: {e}", "WARN")
     return note
+
+
+# ==================== 问题台账：跨轮唯一事实源 ====================
+#
+# 以前分数是对「本轮报出来多少条」算的，而报多少条取决于模型这一轮的状态：
+# 上轮没看出的问题这轮看出来，分数就降，被读成「越修越差」。
+# 台账把计分对象换成**该项目已知且未修复的问题集合**：集合跟轮累积，
+# 只会因为真修好了而变小、因为改出新问题而变大；某一轮漏报不会让债务消失
+# （没确认的一律按仍在算，fail-closed），同一份代码重审则分数不变。
+
+LEDGER_DIR = STATE / "ledger"
+LEDGER_VERSION = 1
+LEDGER_MARK = "台账口径"
+SIM_SAME_ISSUE = 0.55          # 同文件内描述相似度到这就算同一条问题
+
+
+def ledger_path(key: str) -> Path:
+    import hashlib
+    h = hashlib.sha1(str(key or "").encode("utf-8")).hexdigest()[:16]
+    return LEDGER_DIR / f"{h}.json"
+
+
+def load_ledger(key: str) -> dict:
+    p = ledger_path(key)
+    if p.is_file():
+        try:
+            d = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(d, dict) and isinstance(d.get("items"), dict):
+                d.setdefault("rounds", [])
+                d.setdefault("project_key", key)
+                return d
+        except (OSError, ValueError) as e:
+            log(f"台账读失败 {p.name}: {e}", "WARN")
+    return {"version": LEDGER_VERSION, "project_key": key, "items": {}, "rounds": []}
+
+
+def save_ledger(led: dict) -> None:
+    LEDGER_DIR.mkdir(parents=True, exist_ok=True)
+    p = ledger_path(led.get("project_key") or "")
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(led, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(p)
+
+
+def ledger_key_of(task: dict) -> str:
+    """台账跟「同一条项目链」走，不跟主题走
+
+    复审邮件的标题每次都不一样（“修复版”“重传”“v2”），用 project_key 会裂成
+    两个台账；上一轮已经属于哪个台账，本轮就继续用哪个。
+    没有主题也不能塌成同一本空账（会把不同项目合到一起），用自身 mid 立新账。
+    """
+    if task.get("ledger_key"):
+        return task["ledger_key"]
+    base = load_task(task.get("baseline_mid") or "")
+    if base and base.get("ledger_key"):
+        return base["ledger_key"]
+    key = ensure_identity(task).get("project_key") or ""
+    return key or ("mid:" + (task.get("message_id") or "unknown"))
+
+
+def _norm_desc(s) -> str:
+    return re.sub(r"[\s`*_。，,、；;：:（）()\[\]【】'“”‘’”\"]", "", str(s or ""))[:60]
+
+
+def _item_id(path: str, desc: str) -> str:
+    import hashlib
+    return hashlib.sha1(f"{path}|{_norm_desc(desc)}".encode("utf-8")).hexdigest()[:16]
+
+
+def _desc_sim(a, b) -> float:
+    from difflib import SequenceMatcher
+    x, y = _norm_desc(a), _norm_desc(b)
+    if not x or not y:
+        return 0.0
+    if x == y or x in y or y in x:
+        return 1.0
+    return SequenceMatcher(None, x, y).ratio()
+
+
+def _sev_max(a, b):
+    rank = {s: i for i, s in enumerate(_SEV_ORDER)}
+    ka, kb = _sev_key(a), _sev_key(b)
+    if not ka:
+        return kb
+    if not kb:
+        return ka
+    return ka if rank.get(ka, 99) <= rank.get(kb, 99) else kb
+
+
+def _ledger_find(led: dict, path: str, desc: str, any_file: bool = False):
+    """台账里找同一条问题：先同文件精确键，再退到描述相似度
+
+    any_file=True 时不限文件（上轮跟踪表经常不给位置）。
+    """
+    items = led["items"]
+    if path:
+        k = _item_id(path, desc)
+        if k in items:
+            return k
+    best, best_s = None, 0.0
+    for iid, it in items.items():
+        if path and not any_file and it.get("path") != path:
+            continue
+        s = _desc_sim(it.get("desc", ""), desc)
+        if s > best_s:
+            best, best_s = iid, s
+    return best if best_s >= SIM_SAME_ISSUE else None
+
+
+def _pkg_file_sigs(src: Path) -> tuple:
+    """上一轮代码包的逐文件签名：全路径 -> 签名，以及去掉外壳目录后的映射"""
+    full, stripped = {}, {}
+    if not src or not Path(src).is_dir():
+        return full, stripped
+    for f in Path(src).rglob("*"):
+        if not f.is_file():
+            continue
+        try:
+            rel = f.relative_to(src).as_posix()
+        except ValueError:
+            continue
+        sig = _file_sig(f)
+        if not sig:
+            continue
+        full[rel] = sig
+        stripped.setdefault(rel.split("/", 1)[1] if "/" in rel else rel, sig)
+    return full, stripped
+
+
+def _sig_lookup(sigs: tuple, rel: str):
+    """报告里的路径 -> 包内文件签名（兼容报告写不写外层目录名）"""
+    full, stripped = sigs
+    if not rel:
+        return None
+    if rel in full:
+        return full[rel]
+    tail = rel.split("/", 1)[1] if "/" in rel else rel
+    return stripped.get(tail) or stripped.get(rel)
+
+
+def _code_origin(rel: str, cur_sigs: tuple, prev_sigs: tuple) -> str:
+    """本轮新报的问题，代码是不是本轮才改的（字节比对，不问模型）
+
+    same    -> 上轮同样的字节里就有这个文件且内容一致：上轮没报出来（历史遗留）
+    changed -> 文件在但内容变了：本轮改动引入，该扣就扣
+    absent  -> 上轮包里没这个文件（新增文件）
+    unknown -> 上轮代码包不在了，或报告里的路径对不上包内文件，无法归因
+    """
+    if not prev_sigs[0]:
+        return "unknown"          # 没有上轮包可比，不归责
+    cur = _sig_lookup(cur_sigs, rel)
+    if cur is None:
+        return "unknown"          # 报告引的路径在本轮包里找不到
+    prev = _sig_lookup(prev_sigs, rel)
+    if prev is None:
+        return "absent"
+    return "same" if prev == cur else "changed"
+
+
+def _open_counts(led: dict) -> dict:
+    """台账在册未修复问题按级别的条数（拆账的起点）"""
+    c = {}
+    for it in ledger_open(led):
+        _cnt_add(c, it.get("level") or "低危", 1)
+    return c
+
+
+def _cnt_add(c: dict, sev, n: int = 1) -> None:
+    if not sev or not n:
+        return
+    c[sev] = c.get(sev, 0) + n
+    if c[sev] <= 0:
+        c.pop(sev, None)
+
+
+def _score_of_counts(counts: dict):
+    """按给定条数算分（只用来算差值，最终分数仍以 ledger_score 为准）"""
+    rows = [{"level": k} for k, n in (counts or {}).items() for _ in range(int(n))]
+    return compute_score(rows)["score"]
+
+
+def _score_bridge(counts_before: dict, moves, closed: dict, new_by_origin: dict) -> dict:
+    """把分数变化拆成几步，每步都写清是谁造成的
+
+    步骤固定：级别校正 -> 销账 -> 上轮漏报入册 -> 本轮改动引入 -> 无法归因 -> 首轮建档。
+    每步的差值加起来正好等于总分变化（不多不少，本地可复核）。
+    """
+    c = dict(counts_before)
+    cur = _score_of_counts(c)
+    out = {"base": cur, "steps": []}
+
+    def step(name, signed, label):
+        nonlocal cur
+        signed = {k: v for k, v in signed.items() if v}
+        if not signed:
+            return
+        n = sum(abs(v) for v in signed.values())
+        for k, v in signed.items():
+            _cnt_add(c, k, v)
+        nxt = _score_of_counts(c)
+        out["steps"].append({"key": label, "name": name, "count": n,
+                             "delta": round(nxt - cur, 1)})
+        cur = nxt
+
+    if moves:
+        signed = {}
+        for old, new in moves:
+            _cnt_add(signed, old, -1)
+            _cnt_add(signed, new, 1)
+        step("上轮判轻了，按更严级别重算", signed, "escalated")
+    step("判已修复，销账", {k: -v for k, v in (closed or {}).items()}, "fixed")
+    for label, name in (("late_found", "上轮漏报，本轮入册"),
+                        ("regression", "本轮改动引入"),
+                        ("unknown", "无法归因（上轮代码包不在）"),
+                        ("seed", "首轮建档")):
+        step(name, new_by_origin.get(label) or {}, label)
+    out["final"] = cur
+    out["total"] = round(cur - out["base"], 1)
+    return out
+
+
+def ledger_apply(led: dict, rows, tracking: dict, mid: str,
+                 src: Path = None, prev_src: Path = None) -> dict:
+    """把本轮结果并进台账，返回本轮的记账明细（全部本地算，不问模型）
+
+    - 本轮报出 -> 在册（级别取两轮中更严的），台账里原本已修又出现 = 回归
+    - 台账在册但本轮没报出 -> 看跟踪表判定：判「已修复」才销账；未修复/部分修复
+      /无判定一律按仍在保留，并沿用更严的级别（漏报不能刷分）
+    - 本轮报出且台账没有 -> 新入册；再用字节比对分清是本轮改出来的还是上轮漏的
+    """
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    prev_sigs = _pkg_file_sigs(prev_src) if prev_src else ({}, {})
+    cur_sigs = _pkg_file_sigs(src) if src else ({}, {})
+    for it in led["items"].values():
+        it["seen_this_round"] = False
+    was_empty = not led["items"]
+    counts_before = _open_counts(led)
+    moves = []
+    closed_lvl = {}
+    new_lvl = {"late_found": {}, "regression": {}, "unknown": {}, "seed": {}}
+    fixed_out, new_in, late_found = [], [], []
+    regress, untracked, relapse = [], [], []
+    for r in rows or []:
+        desc = _one_line(r.get("desc"), 300)
+        if not desc:
+            continue
+        path = issue_file(r.get("loc")) or "?"
+        sev = _sev_key(r.get("level")) or "低危"   # 级别认不出也得起码算一条，不能免费
+        iid = _ledger_find(led, path, desc)
+        if iid:
+            it = led["items"][iid]
+            if it.get("status") == "fixed":
+                it["relapse"] = int(it.get("relapse") or 0) + 1
+                relapse.append(iid)
+            old_lv = it.get("level")
+            new_lv = _sev_max(old_lv, sev) or old_lv
+            if new_lv != old_lv:
+                moves.append((old_lv, new_lv))
+            it["level"] = new_lv
+            it.update(status="open", seen_this_round=True, desc=desc,
+                      loc=r.get("loc") or it.get("loc"), last_mid=mid, last_seen=now)
+            it["rounds_seen"] = int(it.get("rounds_seen") or 0) + 1
+            continue
+        iid = _item_id(path, desc)
+        if was_empty:
+            origin = "seed"                    # 项目第一轮，没有「上轮」可比
+        else:
+            o = _code_origin(path, cur_sigs, prev_sigs)
+            if o == "same":
+                origin = "late_found"          # 上轮同样的字节里就有 = 上轮漏报
+                late_found.append(iid)
+            elif o in ("changed", "absent"):
+                origin = "regression"          # 字节证明文件变过/是新增的
+                regress.append(iid)
+            else:
+                origin = "unknown"             # 上轮代码包已清理，不归责但不免账
+                untracked.append(iid)
+        _cnt_add(new_lvl[origin if origin in new_lvl else "regression"], sev, 1)
+        led["items"][iid] = {"path": path, "desc": desc,
+                             "level": sev, "loc": r.get("loc") or "",
+                             "status": "open", "seen_this_round": True,
+                             "origin": origin or "regression",
+                             "first_mid": mid, "last_mid": mid, "rounds_seen": 1,
+                             "first_seen": now, "last_seen": now,
+                             "unconfirmed_rounds": 0}
+        new_in.append(iid)
+    # 跟踪表：只用来给「本轮没报出来」的旧问题销账 / 确认仍在
+    tr_items = (tracking or {}).get("items") or {}
+    for ver, key in (("fixed", "fixed_out"), ("partial", "open"), ("unfixed", "open")):
+        for row in tr_items.get(ver) or []:
+            desc = _one_line(row.get("desc"), 300)
+            if not desc:
+                continue
+            iid = _ledger_find(led, issue_file(row.get("loc")) or "", desc, any_file=True)
+            if not iid:
+                continue
+            it = led["items"][iid]
+            if it.get("seen_this_round"):
+                continue                      # 本轮清单已经处理过
+            if ver == "fixed":
+                _cnt_add(closed_lvl, it.get("level") or "低危", 1)
+                it.update(status="fixed", fixed_mid=mid, fixed_at=now)
+                fixed_out.append(iid)
+            else:
+                old_lv = it.get("level")
+                new_lv = _sev_max(old_lv, row.get("level")) or old_lv
+                if new_lv != old_lv:
+                    moves.append((old_lv, new_lv))
+                it["level"] = new_lv
+                it["status"] = "open"
+    for iid, it in led["items"].items():
+        if it.get("status") != "open":
+            continue
+        if it.get("seen_this_round"):
+            it["unconfirmed_rounds"] = 0
+        else:
+            it["unconfirmed_rounds"] = int(it.get("unconfirmed_rounds") or 0) + 1
+    bridge = _score_bridge(counts_before, moves, closed_lvl, new_lvl)
+    chk = ledger_score(led)["score"]
+    if abs(bridge["final"] - chk) > 0.01:      # 拆账必须和台账分对得上，对不上就是算错了
+        log(f"[{mid}] 拆账 {bridge['final']} 与台账分 {chk} 对不上", "WARN")
+    return {"new_in": len(new_in), "late_found": len(late_found),
+            "regression": len(regress), "unknown_origin": len(untracked),
+            "fixed_out": len(fixed_out), "relapse": len(relapse), "bridge": bridge}
+
+
+def ledger_open(led: dict) -> list:
+    return [it for it in led["items"].values() if it.get("status") == "open"]
+
+
+def ledger_score(led: dict) -> dict:
+    """分数 = 同一公式，作用在「台账里还挂着的未修复问题」上"""
+    open_items = ledger_open(led)
+    res = compute_score([{"level": it.get("level")} for it in open_items])
+    res["open"] = len(open_items)
+    res["stale"] = sum(1 for it in open_items
+                       if int(it.get("unconfirmed_rounds") or 0) >= 2)
+    return res
+
+
+def ledger_note(res: dict, diff: dict) -> str:
+    """分数下面必须说清：本轮的变动到底是哪几笔账"""
+    bits = [f"台账在册未修复 {res['open']} 条"]
+    if diff.get("fixed_out"):
+        bits.append(f"本轮销账 {diff['fixed_out']} 条")
+    if diff.get("new_in"):
+        s = f"新入册 {diff['new_in']} 条"
+        if diff.get("late_found"):
+            s += f"（其中 {diff['late_found']} 条经字节比对与上轮完全一致，"
+            s += "属上轮没报出来的历史遗留，不是本轮改坏的）"
+        if diff.get("regression"):
+            s += f"，{diff['regression']} 条所在文件相对上轮有改动（按新问题计）"
+        if diff.get("unknown_origin"):
+            s += f"，{diff['unknown_origin']} 条无法归因（上轮代码包已清理），照账计入"
+        bits.append(s)
+    if diff.get("relapse"):
+        bits.append(f"修过又回来 {diff['relapse']} 条")
+    if res.get("stale"):
+        bits.append(f"其中 {res['stale']} 条已连续两轮没被重新报出，按未修复保留")
+    br = diff.get("bridge") or {}
+    steps = [x for x in (br.get("steps") or [])
+             if abs(x.get("delta") or 0) >= 0.05 and x.get("key") != "seed"]
+    if steps:
+        seg = "、".join(f'{x["name"]} {x["delta"]:+g}' for x in steps)
+        bits.append(f'分数 {br.get("base"):g} → {br.get("final"):g}（{br.get("total"):+g}）'
+                    f'拆开就是：{seg}——分数是台账在册未修复的水位，'
+                    f'涨靠真修好，跌要么是改出新问题、要么是上轮漏报的这轮才入账')
+    return "；".join(bits)
+
+
+def _round_snapshot(led: dict, mid: str):
+    """台账里这一轮的快照（重跑同一任务时直接取，不重复入账）"""
+    hits = [r for r in led.get("rounds") or [] if str(r.get("mid")) == str(mid)]
+    return hits[-1] if hits else None
+
+
+def _task_fill(task: dict, led: dict, round_entry: dict) -> dict:
+    """把台账快照写回任务字段（UI/回信只认这一份）"""
+    rounds = led.get("rounds") or []
+    idx = next((i for i, r in enumerate(rounds)
+                if str(r.get("mid")) == str(task.get("message_id"))), len(rounds) - 1)
+    r = rounds[idx] if rounds else round_entry
+    res = {"score": r["score"], "version": SCORING.get("version"),
+           "counts": r.get("counts") or {}, "penalty": r.get("penalty"),
+           "verdict": r.get("verdict") or "", "open": r.get("open", 0), "detail": {}}
+    for sev, c in (r.get("counts") or {}).items():
+        if c:
+            res["detail"][sev] = {"count": c, "penalty": 0.0}
+    task["score"] = r["score"]
+    task["score_detail"] = {"version": res["version"], "counts": r.get("counts") or {},
+                            "penalty": r.get("penalty"), "verdict": res["verdict"],
+                            "basis": "ledger", "open": r.get("open", 0)}
+    task["ledger"] = {"key": led.get("project_key"), "open": r.get("open", 0),
+                      "rounds": idx + 1,
+                      **{k: r.get(k, 0) for k in ("new_in", "late_found", "regression",
+                                                  "unknown_origin", "fixed_out", "relapse")}}
+    if r.get("bridge"):
+        task["score_bridge"] = r["bridge"]
+    if r.get("note"):
+        task["ledger_note"] = r["note"]
+    if idx > 0:
+        task["score_prev"] = rounds[idx - 1]["score"]
+        task["score_prev_counts"] = rounds[idx - 1].get("counts") or {}
+        task["score_prev_basis"] = "ledger"
+    return res
+
+
+def apply_ledger_and_score(task: dict, rows, tracking: dict, md_file: Path,
+                           src: Path = None) -> dict:
+    """台账入账 -> 用台账算分 -> 快照本轮 -> 改写报告分数行
+
+    分数只可能因为三件事变化：真修好了 / 改出新问题 / 台账新登记了旧债。
+    「这一轮模型多报了几条」不在其中。
+    """
+    mid = task.get("message_id") or ""
+    key = ledger_key_of(task)
+    task["ledger_key"] = key
+    led = load_ledger(key)
+    if _round_snapshot(led, mid):
+        # 同一任务重跑：从报告重放整条链，避免同一轮被记两次
+        log(f"[{mid}] 该任务已在台账中（重跑）——重放全部报告，不重复入账", "WARN")
+        ledger_rebuild(force=True)
+        led = load_ledger(key)
+        r = _round_snapshot(led, mid)
+        if r:
+            res = _task_fill(task, led, r)
+            task["ledger_note"] = (f"{LEDGER_MARK}：重放台账后在册未修复 {r.get('open')} 条"
+                                   "（本轮为同一任务重跑，未重复入账）")
+            _write_score_into_report(md_file, res, mid)
+            return res
+    prev_round = led["rounds"][-1] if led.get("rounds") else None
+    base_t = load_task(task.get("baseline_mid") or "") or {}
+    prev_mid = base_t.get("message_id") or ""
+    prev_src = (WORK / prev_mid / "src") if prev_mid else None
+    diff = ledger_apply(led, rows, tracking, mid, src=src,
+                        prev_src=prev_src if prev_src and prev_src.is_dir() else None)
+    res = ledger_score(led)
+    note = f"{LEDGER_MARK}：" + ledger_note(res, diff)
+    led["rounds"].append({"mid": mid, "note": note,
+                          "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
+                          "score": res["score"], "open": res["open"],
+                          "counts": res["counts"], "penalty": res["penalty"],
+                          "verdict": res["verdict"], "bridge": diff.get("bridge"),
+                          **{k: diff[k] for k in ("new_in", "late_found", "regression",
+                                                  "unknown_origin", "fixed_out", "relapse")}})
+    save_ledger(led)
+    if prev_round:
+        task["score_prev"] = prev_round["score"]
+        task["score_prev_counts"] = prev_round.get("counts") or {}
+        task["score_prev_basis"] = "ledger"
+    task["score"] = res["score"]
+    task["score_detail"] = {"version": res["version"], "counts": res["counts"],
+                            "penalty": res["penalty"], "verdict": res["verdict"],
+                            "basis": "ledger", "open": res["open"]}
+    task["ledger"] = {"key": key, "open": res["open"], "stale": res["stale"],
+                      "rounds": len(led["rounds"]),
+                      **{k: diff[k] for k in ("new_in", "late_found", "regression",
+                                              "unknown_origin", "fixed_out", "relapse")}}
+    task["score_bridge"] = diff.get("bridge")
+    task["ledger_note"] = note
+    if led["rounds"]:
+        led["rounds"][-1]["note"] = task["ledger_note"]
+        save_ledger(led)
+    _write_score_into_report(md_file, res, mid)
+    return res
+
+
+def _write_score_into_report(md_file: Path, res: dict, mid: str) -> None:
+    if md_file is None:
+        return
+    try:
+        p = Path(md_file)
+        txt = p.read_text(encoding="utf-8", errors="replace")
+        new = rewrite_score_in_report(txt, res)
+        if new != txt:
+            p.write_text(new, encoding="utf-8")
+    except OSError as e:
+        log(f"[{mid}] 台账分数写不进报告: {e}", "WARN")
+
+
+def ledger_rebuild(tasks=None, force: bool = False) -> int:
+    """按时间顺序重放存量报告，重建/补齐项目台账（幂等：同一任务只算一轮）
+
+    force=True 先清空台账再全量重放（同一任务重跑后用来去重）。
+    """
+    if force:
+        if LEDGER_DIR.is_dir():
+            for f in LEDGER_DIR.glob("*.json"):
+                try:
+                    f.unlink()
+                except OSError as e:
+                    log(f"清台账失败 {f.name}: {e}", "WARN")
+    pool = [t for t in (tasks if tasks is not None else all_tasks())
+            if t.get("message_id")]
+    pool.sort(key=lambda t: (t.get("created_at_ts") or 0, t.get("message_id") or ""))
+    cache = {}
+    n = 0
+    for t in pool:
+        md = baseline_report_path(t)
+        if md is None:
+            continue
+        try:
+            txt = md.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            log(f"[{t.get('message_id')}] 重放台账时读报告失败: {e}", "WARN")
+            continue
+        rows = extract_issue_rows(txt)
+        if not rows:
+            continue
+        ensure_identity(t)
+        key = ledger_key_of(t)
+        led = cache.get(key)
+        if led is None:
+            led = cache[key] = load_ledger(key)
+        if _round_snapshot(led, t["message_id"]) is None:
+            prev = load_task(t.get("baseline_mid") or "") or {}
+            pm = prev.get("message_id") or ""
+            pr = Path(WORK) / pm / "src" if pm else None
+            diff = ledger_apply(led, rows, parse_tracking(txt), t["message_id"],
+                                src=WORK / t["message_id"] / "src",
+                                prev_src=pr if pr and pr.is_dir() else None)
+            res = ledger_score(led)
+            note = f"{LEDGER_MARK}：" + ledger_note(res, diff)
+            led["rounds"].append({"mid": t["message_id"], "note": note,
+                                  "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
+                                  "score": res["score"], "open": res["open"],
+                                  "counts": res["counts"], "penalty": res["penalty"],
+                                  "verdict": res["verdict"], "bridge": diff.get("bridge"),
+                                  **{k: diff[k] for k in ("new_in", "late_found",
+                                                          "regression", "unknown_origin",
+                                                          "fixed_out", "relapse")}})
+            save_ledger(led)
+        res = _task_fill(t, led, _round_snapshot(led, t["message_id"]))
+        t["ledger_key"] = key        # 落盘：下一轮直接继承，不再靠标题猜
+        save_task(t)
+        n += 1
+    return n
 
 
 def find_baseline(task: dict, tasks=None):
@@ -2002,12 +2559,14 @@ def _verdict_of(cell: str) -> str:
 def parse_tracking(md_text: str) -> dict:
     """确定性统计「上轮问题跟踪」表：回信里的数字由这里算，不问模型"""
     out = {"total": 0, "fixed": 0, "partial": 0, "unfixed": 0, "unknown": 0,
-           "by_level": {}, "recovery": {}, "unfixed_items": []}
+           "by_level": {}, "recovery": {}, "unfixed_items": [],
+           "items": {"fixed": [], "partial": [], "unfixed": [], "unknown": []}}
     lines = str(md_text or "").splitlines()
     for head, cells in _iter_table_rows(lines, 0, ("上轮问题",), ("判定",)):
         jv = _table_col(head, "本轮判定", "判定")
         jd = _table_col(head, "上轮问题", "问题描述", "问题")
         jl = _table_col(head, "级别")
+        jev = _table_col(head, "证据", "位置", "文件")
         def at(j):
             return cells[j] if 0 <= j < len(cells) else ""
         v = _verdict_of(at(jv))
@@ -2015,6 +2574,9 @@ def parse_tracking(md_text: str) -> dict:
         key = {"已修复": "fixed", "部分修复": "partial",
                "未修复": "unfixed", "无法确认": "unknown"}[v]
         out[key] += 1
+        out["items"][key].append({"level": _one_line(at(jl), 8) or "-",
+                                  "desc": _one_line(at(jd), 300),
+                                  "loc": _one_line(at(jev), 120)})
         # 按上轮的级别分桶：修复率只能拿上轮的级别算（本轮重新判级别会漂）
         lv = _sev_key(at(jl)) or "其他"
         bucket = out["by_level"].setdefault(lv, {"fixed": 0, "partial": 0,
@@ -3739,43 +4301,10 @@ def run_review(task, extra: str = "", baseline: dict = None) -> Path:
         warnings.append(f"报告的问题清单里有 {dup} 条重复（同一位置同一描述出现多次），"
                         "请对照代码去重后再看")
         log(f"[{mid}] 报告里有 {dup} 条重复问题", "WARN")
-    task["new_issues"] = len(extract_issue_rows(final_txt))
-    # 评分：统一口径（多轮对比时，上一轮也用同一口径重算）
-    try:
-        _verdicts = ("可放行", "修改后放行", "不建议放行")
-        _model_v = next((v for v in _verdicts if v in final_txt), "")
-        _calc_v = compute_score(extract_issue_rows(final_txt))["verdict"]
-        if _model_v and _calc_v and _model_v != _calc_v:
-            warnings.append(f"结论档位（{_model_v}）与统一口径计算结果（{_calc_v}）不一致，"
-                            "以口径为准")
-            log(f"[{mid}] 档位不一致：报告写 {_model_v}，口径算出 {_calc_v}（以口径为准）",
-                "WARN")
-        cur_score = compute_score(extract_issue_rows(final_txt))
-        task["score"] = cur_score["score"]
-        task["score_detail"] = {"version": cur_score["version"],
-                                "counts": cur_score["counts"],
-                                "penalty": cur_score["penalty"],
-                                "verdict": cur_score["verdict"]}
-        if baseline:
-            base_md = baseline_report_path(load_task(baseline["mid"]) or {})
-            if base_md is not None:
-                prev = score_of_report(base_md.read_text(encoding="utf-8", errors="replace"))
-                task["score_prev"] = prev["score"]
-                task["score_prev_counts"] = prev["counts"]
-                log(f"[{mid}] 同口径对比：上轮 {prev['score']} 分 -> 本轮 "
-                    f"{cur_score['score']} 分（Δ{cur_score['score'] - prev['score']:+d}）")
-    except Exception as e:
-        warnings.append(f"评分计算失败：{e}")
-        log(f"[{mid}] 评分计算失败: {e}", "WARN")
-    # 先分清「代码变了」还是「同一份代码重审」：不写清楚就会被读成越修越差
-    try:
-        note = attach_score_context(task, md)
-        if note:
-            warnings.append(note)
-            log(f"[{mid}] {note}", "WARN")
-    except Exception as e:
-        warnings.append(f"同包重审检测失败：{e}")
-        log(f"[{mid}] 同包重审检测失败（不影响审核）: {e}", "WARN")
+    rows_now = extract_issue_rows(final_txt)
+    task["new_issues"] = len(rows_now)
+    # 跟踪表先解析：台账要靠它给旧问题销账/确认仍在
+    tr = {}
     if baseline:
         tr = parse_tracking(final_txt)
         task["tracking"] = tr
@@ -3787,7 +4316,46 @@ def run_review(task, extra: str = "", baseline: dict = None) -> Path:
             if tr["total"] < baseline["total"]:
                 warnings.append(f"上轮 {baseline['total']} 条问题只核对了 {tr['total']} 条，"
                                 "遗漏部分请对照上一轮报告复核")
-
+    # 评分：对「项目台账里还挂着的未修复问题」算，不对本轮报出的条数算
+    try:
+        _verdicts = ("可放行", "修改后放行", "不建议放行")
+        _model_v = next((v for v in _verdicts if v in final_txt), "")
+        _calc_v = compute_score(rows_now)["verdict"]
+        if _model_v and _calc_v and _model_v != _calc_v:
+            warnings.append(f"结论档位（{_model_v}）与统一口径计算结果（{_calc_v}）不一致，"
+                            "以口径为准")
+            log(f"[{mid}] 档位不一致：报告写 {_model_v}，口径算出 {_calc_v}（以口径为准）",
+                "WARN")
+        cur_score = apply_ledger_and_score(task, rows_now, tr, md, src=src)
+        log(f"[{mid}] {LEDGER_MARK}: {task['ledger_note']} 分={cur_score['score']}")
+        if task.get("score_prev") is not None:
+            log(f"[{mid}] 台账评分：上轮 {task['score_prev']} 分 -> 本轮 "
+                f"{cur_score['score']} 分"
+                f"（Δ{cur_score['score'] - int(task['score_prev']):+d}）")
+    except Exception as e:
+        warnings.append(f"台账评分失败，退回「本轮清单」口径：{e}")
+        log(f"[{mid}] 台账评分失败，退回本轮清单口径: {e}", "WARN")
+        cur_score = compute_score(rows_now)
+        task["score"] = cur_score["score"]
+        task["score_detail"] = {"version": cur_score["version"],
+                                "counts": cur_score["counts"],
+                                "penalty": cur_score["penalty"],
+                                "verdict": cur_score["verdict"], "basis": "report"}
+        if baseline:
+            base_md = baseline_report_path(load_task(baseline["mid"]) or {})
+            if base_md is not None:
+                prev = score_of_report(base_md.read_text(encoding="utf-8", errors="replace"))
+                task["score_prev"] = prev["score"]
+                task["score_prev_counts"] = prev["counts"]
+    # 先分清「代码变了」还是「同一份代码重审」：不写清楚就会被读成越修越差
+    try:
+        note = attach_score_context(task, md)
+        if note:
+            warnings.append(note)
+            log(f"[{mid}] {note}", "WARN")
+    except Exception as e:
+        warnings.append(f"同包重审检测失败：{e}")
+        log(f"[{mid}] 同包重审检测失败（不影响审核）: {e}", "WARN")
     html = rpt / "代码审核报告.html"
     if md2html:
         try:
@@ -4199,10 +4767,19 @@ def build_body(task, report_dir: Path, files) -> str:
             delta = int(cur_s) - int(prev_s)
             trend = "↑ 改善" if delta > 0 else ("↓ 变差" if delta < 0 else "→ 持平")
             ver = (task.get("score_detail") or {}).get("version", "")
-            track.append(f"同口径评分（v{ver}）：上轮 {prev_s} 分 → 本轮 {cur_s} 分"
-                         f"（{delta:+d}，{trend}）")
-            track.append("两轮用**同一套口径**重算，所以这个变化可以直接比较；"
-                         "问题条数会随代码量与审核批次波动，分数只看严重度分布。")
+            basis = (task.get("score_detail") or {}).get("basis")
+            if basis == "ledger":
+                op = (task.get("score_detail") or {}).get("open")
+                track.append(f"台账评分（v{ver}）：上轮 {prev_s} 分 → 本轮 {cur_s} 分"
+                             f"（{delta:+d}，{trend}）在册未修复 {op} 条")
+                track.append("分数算的是「项目问题台账里还挂着多少未修复问题」，"
+                             "不是「这一轮报出来多少条」：只有真修好了才会涨，"
+                             "因修改引入的新问题照旧扣分；某一轮多报漏报不会让分数漂。")
+            else:
+                track.append(f"同口径评分（v{ver}）：上轮 {prev_s} 分 → 本轮 {cur_s} 分"
+                             f"（{delta:+d}，{trend}）")
+                track.append("两轮用**同一套口径**重算，所以这个变化可以直接比较；"
+                             "问题条数会随代码量与审核批次波动，分数只看严重度分布。")
         track.append(tracking_line(tr, task.get("new_issues") or 0))
         rec = recovery_line(tr)
         if rec:
@@ -5143,15 +5720,20 @@ def _model_list(quiet: bool = False) -> int:
 
 
 def cmd_score(args) -> int:
-    """按统一口径重算历史报告的分数
+    """按统一口径回填分数：先重放项目台账，再把台账分写回任务
 
-    以前分数是模型每轮自己写的（上轮 58、本轮 62），修了一堆严重问题分数反而升，
-    开发者根本没法信。这个命令把有报告的任务按现在的口径重算一遗，
-    回填到任务里，旧轮次也能跟新轮次直接对比。
+    分数算的是台账里还挂着的未修复问题，不是「本轮报出多少条」——
+    否则某一轮多报几条，就被读成越修越差。
     """
     ids = ([args.id] if getattr(args, "id", None)
            else [t.get("message_id") for t in all_tasks()])
-    done = changed = skipped = 0
+    before = {t.get("message_id"): t.get("score") for t in all_tasks()}
+    try:
+        n = ledger_rebuild()
+        print(f"台账重放：更新 {n} 个任务（口径 v{scoring_version()}）")
+    except Exception as e:
+        print(f"台账重放失败，退回逐份报告重算：{e}", "WARN")
+    done = changed = skipped = ledgers = 0
     for mid in ids:
         t = load_task(mid) if mid else None
         if not t:
@@ -5162,36 +5744,30 @@ def cmd_score(args) -> int:
         if md is None:
             continue
         try:
-            res = score_of_report(md.read_text(encoding="utf-8", errors="replace"))
-        except Exception as e:
+            body = md.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
             print(f"{mid}: 报告读失败 {e}")
             continue
-        if not res["total"]:
+        detail = t.get("score_detail") or {}
+        if detail.get("basis") == "ledger":
+            res = {"score": t.get("score"), "version": detail.get("version"),
+                   "counts": detail.get("counts") or {}, "penalty": detail.get("penalty"),
+                   "verdict": detail.get("verdict"), "open": detail.get("open")}
+            ledgers += 1
+        else:
+            res = score_of_report(body)
+        if not sum((res.get("counts") or {}).values()):
             # 一行问题都没解析出来，说明报告格式不对，不能当「没问题 = 100 分」
             skipped += 1
             print(f"{mid}: 报告里没解析出问题行，跳过（不写满分）")
             continue
-        old = t.get("score")
-        t["score"] = res["score"]
-        t["score_detail"] = {"version": res["version"], "counts": res["counts"],
-                            "penalty": res["penalty"], "verdict": res["verdict"]}
-        prev = t.get("baseline_mid")
-        pt = load_task(prev) if prev else None
-        if pt:
-            pmd = baseline_report_path(pt)
-            if pmd is not None:
-                pres = score_of_report(pmd.read_text(encoding="utf-8", errors="replace"))
-                if pres["total"]:
-                    t["score_prev"] = pres["score"]
-                    t["score_prev_counts"] = pres["counts"]
-        save_task(t)
+        old = before.get(mid)
         done += 1
         if old != res["score"]:
             changed += 1
-        # 历史报告也补上：上轮清单修复率 + 同包重审说明（都是纯本地重算）
+        # 历史报告也补上：上轮清单修复率 + 台账/同包说明（都是纯本地重算）
         extra = ""
         try:
-            body = md.read_text(encoding="utf-8", errors="replace")
             tr = parse_tracking(body)
             if tr.get("total"):
                 t["tracking"] = tr
@@ -5201,13 +5777,16 @@ def cmd_score(args) -> int:
                 extra += f"\n    ⚠ {note}"
             save_task(t)
         except Exception as e:
-            print(f"{mid}: 补跟踪/同包说明失败 {e}")
+            print(f"{mid}: 补跟踪/台账说明失败 {e}")
+        c = res.get("counts") or {}
         print(f"{mid}: {old} -> {res['score']} 分  "
-              f"严重{res['counts']['严重']} 高危{res['counts']['高危']} "
-              f"中危{res['counts']['中危']} 低危{res['counts']['低危']}  "
-              f"{res['verdict']}{extra}")
-    print(f"已按口径 v{scoring_version()} 重算 {done} 份报告"
-          f"（{changed} 份与之前不同，{skipped} 份因解析不出问题行而跳过）")
+              f"严重{c.get('严重', 0)} 高危{c.get('高危', 0)} "
+              f"中危{c.get('中危', 0)} 低危{c.get('低危', 0)}  {res['verdict']}"
+              + (f"  台账在册未修复 {res['open']} 条" if res.get("open") is not None else "")
+              + extra)
+    print(f"已按口径 v{scoring_version()} 更新 {done} 个任务"
+          f"（台账口径 {ledgers} 个，{changed} 个与之前不同，"
+          f"{skipped} 个因解析不出问题行而跳过）")
     return 0
 
 

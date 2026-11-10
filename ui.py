@@ -710,6 +710,33 @@ def page_task(mid: str, flash: str = "", err: bool = False) -> str:
         score_html = (f'<div class="k">评分</div><div><b>{esc(t["score"])}</b> / 100'
                       f'<span class="sub">（口径 v{esc(ver)}：{esc(dist)}）</span></div>'
                       + delta)
+        lg = t.get("ledger") or {}
+        if lg.get("open") is not None:
+            det = (t.get("score_detail") or {})
+            lab = "台账在册未修复" if det.get("basis") == "ledger" else "本轮清单条数"
+            bits = [f"{lab} {lg['open']} 条"]
+            for k, name in (("fixed_out", "本轮销账"), ("new_in", "新入册"),
+                            ("late_found", "其中历史遗留"), ("regression", "改动新引入"),
+                            ("relapse", "修过又回来")):
+                if lg.get(k):
+                    bits.append(f"{name} {lg[k]}")
+            if lg.get("stale"):
+                bits.append(f"连续两轮未重新报出 {lg['stale']} 条（按未修复保留）")
+            score_html += (f'<div class="k">问题台账</div><div>{esc("，".join(bits))}'
+                           f'<span class="sub">（已核 {lg.get("rounds", 0)} 轮）</span></div>')
+        br = t.get("score_bridge") or {}
+        steps = [x for x in (br.get("steps") or [])
+                 if abs(x.get("delta") or 0) >= 0.05 and x.get("key") != "seed"]
+        if steps:
+            parts = []
+            for x in steps:
+                d = x.get("delta") or 0
+                col = "#30d158" if d > 0 else "#ff453a"
+                parts.append(f'{esc(x["name"])} {x["count"]} 条 '
+                             f'<span style="color:{col}">{d:+g} 分</span>')
+            score_html += (f'<div class="k">分数为什么变</div>'
+                           f'<div>{br.get("base"):g} → {br.get("final"):g}：'
+                           f'{"；".join(parts)}</div>')
         trk = t.get("tracking") or {}
         rec = (trk.get("recovery") or {}).get("pct")
         if rec is not None:
@@ -725,7 +752,7 @@ def page_task(mid: str, flash: str = "", err: bool = False) -> str:
                            f'<span class="sub">（严重度加权：{esc("、".join(lv))}）</span></div>')
         au = t.get("audit") or {}
         if au.get("files") and au.get("prev_files"):
-            warn = (" ⚠ 两轮审核深度不同，分数不可直接比"
+            warn = (" ⚠ 两轮审核深度不同，新增问题已按字节归因"
                     if au["files"] >= 1.5 * au["prev_files"] or
                     au["rows"] >= 1.5 * au["prev_rows"] else "")
             score_html += (f'<div class="k">审核覆盖面</div><div>本轮 {esc(au["files"])} 文件'
@@ -1189,7 +1216,8 @@ class Handler(BaseHTTPRequestHandler):
                         {k: t.get(k) for k in
                          ("message_id", "subject", "state", "attempts", "created_at",
                           "replied_at", "last_error", "score", "score_prev",
-                          "score_note", "review_round", "baseline_mid")}
+                          "score_note", "ledger", "score_bridge", "tracking",
+                          "review_round", "baseline_mid")}
                         for t in tasks()
                     ],
                 }, ensure_ascii=False, indent=2), "application/json; charset=utf-8")
