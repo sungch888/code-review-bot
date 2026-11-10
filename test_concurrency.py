@@ -159,15 +159,17 @@ def main():
 
         t0 = time.time()
         out = B.run_parallel([1, 2, 3, 4], job, workers=4)
-        dt = time.time() - t0
+        dt_par = time.time() - t0
         check("结果按传入顺序返回", out == [2, 4, 6, 8], str(out))
-        check("4 路并发比串行快", dt < 0.35, f"{dt:.2f}s")
         check("所有子任务都执行了", sorted(seen) == [1, 2, 3, 4], str(seen))
 
         t0 = time.time()
         B.run_parallel([1, 2, 3, 4], job, workers=1)
-        check("workers=1 时串行（旧行为）", time.time() - t0 >= 0.45,
-              f"{time.time() - t0:.2f}s")
+        dt_seq = time.time() - t0
+        # 相对判据（绝对阈值会因机器负载而误报）
+        check("4 路并发明显快于串行", dt_par < dt_seq * 0.8,
+              f"并发 {dt_par:.2f}s vs 串行 {dt_seq:.2f}s")
+        check("workers=1 时确实是串行", dt_seq >= 0.45, f"{dt_seq:.2f}s")
         check("空列表直接返回", B.run_parallel([], job, workers=4) == [])
 
         def boom(i, x):

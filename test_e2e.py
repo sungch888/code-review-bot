@@ -671,6 +671,21 @@ def main():
     finally:
         env.close()
 
+    # ================= S17 复审没匹配上基线时要明说 =================
+    env = Env()
+    try:
+        env.add_task("msg_s17", "代码审核 - 某项目（第2轮）", SMALL)
+        env.run("msg_s17")
+        t = B.load_task("msg_s17")
+        check("标题带轮次但没基线 -> 标记了不匹配", t.get("baseline_mismatch") is True,
+              str(t.get("baseline_mismatch")))
+        body = env.body("msg_s17")
+        check("回信里明说未匹配到上一轮", "未匹配到上一轮" in body, body[-400:])
+        check("回信里给了怎么改标题的指引", "标题" in body and "轮次标记" in body,
+              body[-400:])
+    finally:
+        env.close()
+
     # ================= S14 只审不发 / 复审（不读邮件、不发信）=================
     env = Env()
     try:

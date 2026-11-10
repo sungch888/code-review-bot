@@ -175,6 +175,25 @@ def main():
                    with_report=False)
     check("多轮历史取最近一轮", (B.find_baseline(last) or {}).get("message_id") == "msg_r1b")
 
+    # ---------- C2. 主题归一规则（复审能不能匹配上）----------
+    same = [
+        ("代码审核 - order-service 服务端项目", "order service 服务端项目"),
+        ("代码审核 - order-service 服务端项目（第2轮）", "order service 服务端项目"),
+        ("代码审核 - order-service 服务端项目 第2轮", "order service 服务端项目"),
+        ("代码审核 - order-service 服务端项目（第二版）", "order service 服务端项目"),
+        ("代码审核 - order-service 服务端项目 v2", "order service 服务端项目"),
+        ("Re: 代码审核 - order-service 服务端项目", "order service 服务端项目"),
+    ]
+    for subj, want in same:
+        got = B.project_key(subj)
+        check(f"主题归一 -> {want!r}: {subj[:30]}", got == want, got)
+    for subj in ("代码审核 - order-service 服务端项目（修复后重新送审）",
+                 "代码审核 - order-service 服务端项目【已修复】",
+                 "代码审核 - order-service 服务端项目 - 2026-11-10"):
+        got = B.project_key(subj)
+        check(f"额外文字会破坏匹配（需提示）: {subj[-14:]}",
+              got != "order service 服务端项目", got)
+
     # ---------- C. 确定性解析 ----------
     rows = B.extract_issue_rows(ISSUE_REPORT)
     check("问题清单解析出行数", len(rows) == 3, str(len(rows)))

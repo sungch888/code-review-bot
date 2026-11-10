@@ -3539,6 +3539,14 @@ def build_body(task, report_dir: Path, files) -> str:
             if rest > 0:
                 track.append(f"- （另有 {rest} 项见附件报告「上轮问题跟踪」）")
         track.append("")
+    elif task.get("baseline_mismatch"):
+        # 认不出上一轮 -> 明说，别让发件人以为「复审功能坏了」
+        track.append("")
+        track.append("---- 复审提示 ----")
+        track.append("本次**未匹配到上一轮的审核报告**，因此按全新项目审核，"
+                     "报告里没有「上轮问题跟踪」一节。")
+        track.append("若这确实是复审，请检查邮件标题是否与上一轮**保持一致**"
+                     "（只改「（第2轮）」这类轮次标记即可；其它文字变化会导致匹配失败）。")
 
     lines = [
         f"{task.get('from_name') or ''} 你好，",
@@ -3729,6 +3737,13 @@ def process_task(mid: str) -> str:
             t["review_round"] = baseline["round"]
         else:
             t.setdefault("review_round", round_of(t.get("subject", "")) or 1)
+            # 标题里写了轮次（第2轮/第二版/v2）却没匹配到上一轮 ->
+            # 说明发件人**以为**这是复审，但系统认成了新项目。
+            # 必须告诉他，否则他拿到的报告没有「上轮问题跟踪」，还以为功能坏了。
+            if round_of(t.get("subject", "")) > 1:
+                t["baseline_mismatch"] = True
+                log(f"[{mid}] 标题带轮次标记但未匹配到上一轮报告，"
+                    f"本轮按全新项目审核（项目标识: {project_key(t.get('subject','')) or '空'}）", "WARN")
         t.setdefault("project_key", project_key(t.get("subject", "")))
         save_task(t)
         files = collect_source_files(src, CONFIG["max_review_files"])
